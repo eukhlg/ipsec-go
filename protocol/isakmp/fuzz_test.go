@@ -26,3 +26,20 @@ func FuzzDecodePacket(f *testing.F) {
 		}
 	})
 }
+
+func FuzzParseTransforms(f *testing.F) {
+	seed, err := phase1Transform(EncryptionAESCBC, HashSHA1, DHGroup2, 128).marshalBody()
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed)
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, body []byte) {
+		transform, err := decodeTransform(body)
+		if err != nil {
+			return
+		}
+		_, _ = ParsePhase1Transform(transform)
+		_, _ = ParseESPTransform(transform)
+	})
+}
