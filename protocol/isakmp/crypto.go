@@ -112,6 +112,8 @@ type CBCContext struct {
 	iv    []byte
 }
 
+func (c *CBCContext) CurrentIV() []byte { return append([]byte(nil), c.iv...) }
+
 func NewCBCContext(transform Phase1Transform, key, iv []byte) (*CBCContext, error) {
 	var block cipher.Block
 	var err error
