@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"encoding/binary"
 	"net"
 	"testing"
 	"time"
@@ -104,5 +105,40 @@ func TestESPRegistryRekeyOverlapAndLifecycleRemoval(t *testing.T) {
 	registry.RemoveIKE(cookie)
 	if registry.Count() != 0 {
 		t.Fatalf("IKE removal left %d SAs", registry.Count())
+	}
+}
+
+func TestESPBridgeMovesFlowToReplacementSAAfterDelete(t *testing.T) {
+	peer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 4500}
+	logicalPeer := &net.UDPAddr{IP: peer.IP, Port: 40000}
+	cookie := isakmp.Cookie{9}
+	first := testESPPair(isakmp.EncapsulationNATTTransport)
+	first.ResponderCookie = cookie
+	second := testESPPair(isakmp.EncapsulationNATTTransport)
+	second.ResponderCookie = cookie
+	second.Inbound.SPI, second.Outbound.SPI = 0x33333333, 0x44444444
+	registry := NewESPRegistry()
+	if err := registry.Install(peer, first); err != nil {
+		t.Fatal(err)
+	}
+	bridge, err := NewESPBridge(NewEngine(Config{HostName: "server"}), registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry.mu.RLock()
+	oldSession := registry.bySPI[first.Inbound.SPI]
+	registry.mu.RUnlock()
+	bridge.flows[logicalPeer.String()] = espFlow{session: oldSession, peer: peer, clientPort: 40000}
+	if err := registry.Install(peer, second); err != nil {
+		t.Fatal(err)
+	}
+	registry.Remove(first.Outbound.SPI)
+
+	datagram, err := bridge.SealL2TP(logicalPeer, []byte{1, 2, 3})
+	if err != nil {
+		t.Fatalf("seal after rekey: %v", err)
+	}
+	if got := binary.BigEndian.Uint32(datagram.Payload[:4]); got != second.Outbound.SPI {
+		t.Fatalf("outbound SPI=%08x want=%08x", got, second.Outbound.SPI)
 	}
 }

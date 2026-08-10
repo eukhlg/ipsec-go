@@ -21,6 +21,7 @@ var (
 
 type espSession struct {
 	peerIP                  net.IP
+	peer                    net.Addr
 	inbound, outbound       *esp.SA
 	encapsulation           uint16
 	inboundSPI, outboundSPI uint32
@@ -33,10 +34,11 @@ type ESPRegistry struct {
 	inbound map[uint32]*espSession
 	bySPI   map[uint32]*espSession
 	byIKE   map[isakmp.Cookie]map[*espSession]struct{}
+	latest  map[isakmp.Cookie]*espSession
 }
 
 func NewESPRegistry() *ESPRegistry {
-	return &ESPRegistry{inbound: make(map[uint32]*espSession), bySPI: make(map[uint32]*espSession), byIKE: make(map[isakmp.Cookie]map[*espSession]struct{})}
+	return &ESPRegistry{inbound: make(map[uint32]*espSession), bySPI: make(map[uint32]*espSession), byIKE: make(map[isakmp.Cookie]map[*espSession]struct{}), latest: make(map[isakmp.Cookie]*espSession)}
 }
 
 func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
@@ -59,7 +61,7 @@ func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	session := &espSession{peerIP: append(net.IP(nil), ip...), inbound: inbound, outbound: outbound, encapsulation: pair.Transform.Encapsulation, inboundSPI: pair.Inbound.SPI, outboundSPI: pair.Outbound.SPI, ikeCookie: pair.ResponderCookie}
+	session := &espSession{peerIP: append(net.IP(nil), ip...), peer: peer, inbound: inbound, outbound: outbound, encapsulation: pair.Transform.Encapsulation, inboundSPI: pair.Inbound.SPI, outboundSPI: pair.Outbound.SPI, ikeCookie: pair.ResponderCookie}
 	if old := r.bySPI[pair.Inbound.SPI]; old != nil {
 		r.removeLocked(old)
 	}
@@ -73,6 +75,7 @@ func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
 			r.byIKE[pair.ResponderCookie] = make(map[*espSession]struct{})
 		}
 		r.byIKE[pair.ResponderCookie][session] = struct{}{}
+		r.latest[pair.ResponderCookie] = session
 	}
 	return nil
 }
@@ -122,6 +125,7 @@ func (r *ESPRegistry) Close() {
 	r.inbound = make(map[uint32]*espSession)
 	r.bySPI = make(map[uint32]*espSession)
 	r.byIKE = make(map[isakmp.Cookie]map[*espSession]struct{})
+	r.latest = make(map[isakmp.Cookie]*espSession)
 	r.mu.Unlock()
 }
 
@@ -134,8 +138,32 @@ func (r *ESPRegistry) removeLocked(session *espSession) {
 		delete(sessions, session)
 		if len(sessions) == 0 {
 			delete(r.byIKE, session.ikeCookie)
+			delete(r.latest, session.ikeCookie)
+		} else if r.latest[session.ikeCookie] == session {
+			// This is normally only reached when the newest SA itself expires.
+			// Keep any overlapping SA usable until the peer completes another rekey.
+			for replacement := range sessions {
+				r.latest[session.ikeCookie] = replacement
+				break
+			}
 		}
 	}
+}
+
+// replacement returns the newest live child SA belonging to the same IKE SA.
+// Quick Mode rekeying deliberately overlaps the old and new child SAs, so an
+// L2TP flow may still point at the old SA when the peer deletes it.
+func (r *ESPRegistry) replacement(session *espSession) *espSession {
+	if session == nil || session.ikeCookie == (isakmp.Cookie{}) {
+		return nil
+	}
+	r.mu.RLock()
+	replacement := r.latest[session.ikeCookie]
+	r.mu.RUnlock()
+	if replacement == nil || replacement == session || replacement.revoked.Load() || !replacement.peerIP.Equal(session.peerIP) || replacement.encapsulation != session.encapsulation {
+		return nil
+	}
+	return replacement
 }
 func (r *ESPRegistry) Count() int { r.mu.RLock(); defer r.mu.RUnlock(); return len(r.inbound) }
 
@@ -226,6 +254,18 @@ func (b *ESPBridge) SealL2TP(peer net.Addr, payload []byte) (ESPDatagram, error)
 	}
 	datagram, err := sealUDPReply(flow.session, flow.peer, flow.clientPort, payload)
 	if errors.Is(err, esp.ErrSALifetime) {
+		b.Registry.Remove(flow.session.inboundSPI)
+	}
+	if errors.Is(err, ErrUnknownESP) || errors.Is(err, esp.ErrSALifetime) {
+		if replacement := b.Registry.replacement(flow.session); replacement != nil {
+			flow.session, flow.peer = replacement, replacement.peer
+			b.mu.Lock()
+			b.flows[peer.String()] = flow
+			b.mu.Unlock()
+			datagram, err = sealUDPReply(flow.session, flow.peer, flow.clientPort, payload)
+		}
+	}
+	if errors.Is(err, esp.ErrSALifetime) && !flow.session.revoked.Load() {
 		b.Registry.Remove(flow.session.inboundSPI)
 	}
 	return datagram, err
