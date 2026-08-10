@@ -36,11 +36,16 @@ func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
 	if ip == nil {
 		return ErrESPPeer
 	}
-	inbound, err := esp.NewSA(esp.SAConfig{SPI: pair.Inbound.SPI, Transform: pair.Transform, EncryptionKey: pair.Inbound.EncryptionKey, AuthenticationKey: pair.Inbound.AuthenticationKey})
+	lifetime := time.Duration(pair.Transform.LifetimeSeconds) * time.Second
+	limits := esp.Limits{}
+	if pair.Transform.LifetimeKilobytes != 0 {
+		limits.Bytes = uint64(pair.Transform.LifetimeKilobytes) * 1024
+	}
+	inbound, err := esp.NewSA(esp.SAConfig{SPI: pair.Inbound.SPI, Transform: pair.Transform, EncryptionKey: pair.Inbound.EncryptionKey, AuthenticationKey: pair.Inbound.AuthenticationKey, Lifetime: lifetime, Limits: limits})
 	if err != nil {
 		return err
 	}
-	outbound, err := esp.NewSA(esp.SAConfig{SPI: pair.Outbound.SPI, Transform: pair.Transform, EncryptionKey: pair.Outbound.EncryptionKey, AuthenticationKey: pair.Outbound.AuthenticationKey})
+	outbound, err := esp.NewSA(esp.SAConfig{SPI: pair.Outbound.SPI, Transform: pair.Transform, EncryptionKey: pair.Outbound.EncryptionKey, AuthenticationKey: pair.Outbound.AuthenticationKey, Lifetime: lifetime, Limits: limits})
 	if err != nil {
 		return err
 	}

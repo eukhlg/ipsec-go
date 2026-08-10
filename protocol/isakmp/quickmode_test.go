@@ -24,7 +24,9 @@ func TestQuickModeResponderTranscript(t *testing.T) {
 	offeredSPI := []byte{0x01, 0x02, 0x03, 0x04}
 	sa := SecurityAssociation{DOI: DOIIPsec, Situation: SituationIdentityOnly, Proposals: []Proposal{{Number: 1, ProtocolID: ProtocolESP, SPI: offeredSPI, Transforms: []Transform{esp}}}}
 	ni := bytes.Repeat([]byte{0x66}, 20)
-	after := []Payload{sa, DataPayload{Kind: PayloadNonce, Data: ni}}
+	idci := Identification{IDType: IDIPv4Address, ProtocolID: 17, Port: 1701, Data: []byte{192, 0, 2, 10}}
+	idcr := Identification{IDType: IDIPv4Address, ProtocolID: 17, Port: 1701, Data: []byte{192, 0, 2, 1}}
+	after := []Payload{sa, DataPayload{Kind: PayloadNonce, Data: ni}, idci, idcr}
 	_, afterWire, _ := MarshalPayloads(after)
 	hash1, _ := QuickModeHash1(phase1, secrets.SKEYIDa, messageID, afterWire)
 	first1, body1, _ := MarshalPayloads(append([]Payload{DataPayload{Kind: PayloadHash, Data: hash1}}, after...))
@@ -49,6 +51,9 @@ func TestQuickModeResponderTranscript(t *testing.T) {
 		t.Fatal("HASH(2) mismatch")
 	}
 	selected := payloads2[1].(SecurityAssociation)
+	if len(payloads2) != 5 || payloads2[3].(Identification).Port != 1701 || payloads2[4].(Identification).Port != 1701 {
+		t.Fatalf("selectors were not echoed: %#v", payloads2)
+	}
 	if bytes.Equal(selected.Proposals[0].SPI, offeredSPI) {
 		t.Fatal("responder reused initiator SPI")
 	}
@@ -66,6 +71,34 @@ func TestQuickModeResponderTranscript(t *testing.T) {
 	}
 	if pair.Outbound.SPI != binary.BigEndian.Uint32(offeredSPI) || pair.Inbound.SPI != binary.BigEndian.Uint32(selected.Proposals[0].SPI) || len(pair.Inbound.EncryptionKey) != 16 || len(pair.Inbound.AuthenticationKey) != 20 {
 		t.Fatalf("pair=%#v", pair)
+	}
+}
+
+func TestQuickModeRejectsUnsafeSelectorAndClearsState(t *testing.T) {
+	phase1 := Phase1Transform{Encryption: EncryptionAESCBC, Hash: HashSHA1, AuthMethod: AuthPreSharedKey, DHGroup: DHGroup2, KeyBits: 128}
+	secrets := Phase1Secrets{SKEYIDa: bytes.Repeat([]byte{0x11}, 20), SKEYIDd: bytes.Repeat([]byte{0x22}, 20), Key: bytes.Repeat([]byte{0x33}, 16)}
+	lastBlock := bytes.Repeat([]byte{0x44}, 16)
+	responder, err := NewQuickModeResponder(QuickModeConfig{Transform: phase1, Secrets: secrets, InitiatorCookie: Cookie{1}, ResponderCookie: Cookie{2}, LastPhase1Block: lastBlock, Random: bytes.NewReader(bytes.Repeat([]byte{0x55}, 512))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageID := uint32(7)
+	espTransform := Transform{Number: 1, ID: TransformESPAES, Attributes: []Attribute{TVAttribute(AttributeP2Encapsulation, EncapsulationTransport), TVAttribute(AttributeP2Authentication, ESPAuthHMACSHA196), TVAttribute(AttributeP2KeyLength, 128)}}
+	sa := SecurityAssociation{DOI: DOIIPsec, Situation: SituationIdentityOnly, Proposals: []Proposal{{Number: 1, ProtocolID: ProtocolESP, SPI: []byte{1, 2, 3, 4}, Transforms: []Transform{espTransform}}}}
+	ni := DataPayload{Kind: PayloadNonce, Data: bytes.Repeat([]byte{0x66}, 20)}
+	badID := Identification{IDType: IDIPv4Address, ProtocolID: 6, Port: 22, Data: []byte{192, 0, 2, 10}}
+	after := []Payload{sa, ni, badID, badID}
+	_, afterWire, _ := MarshalPayloads(after)
+	hash1, _ := QuickModeHash1(phase1, secrets.SKEYIDa, messageID, afterWire)
+	first, body, _ := MarshalPayloads(append([]Payload{DataPayload{Kind: PayloadHash, Data: hash1}}, after...))
+	iv, _ := Phase2IV(phase1, lastBlock, messageID)
+	cipher, _ := NewCBCContext(phase1, secrets.Key, iv)
+	wire, _ := (Packet{InitiatorCookie: Cookie{1}, ResponderCookie: Cookie{2}, Exchange: ExchangeQuickMode, Flags: FlagEncrypted, MessageID: messageID, FirstPayload: first, EncryptedPayload: cipher.Encrypt(body)}).MarshalBinary()
+	if _, err := responder.Handle(wire); err == nil || responder.State() != QuickModeFailed {
+		t.Fatalf("state=%d error=%v", responder.State(), err)
+	}
+	if _, ok := responder.Pair(); ok {
+		t.Fatal("failed exchange exposed an ESP pair")
 	}
 }
 

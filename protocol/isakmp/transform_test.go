@@ -82,9 +82,11 @@ func TestParseESPTransform(t *testing.T) {
 		TVAttribute(AttributeP2Encapsulation, EncapsulationTransport),
 		TVAttribute(AttributeP2Authentication, ESPAuthHMACSHA196),
 		TVAttribute(AttributeP2KeyLength, 256),
+		TVAttribute(AttributeP2LifeType, LifeTypeKilobytes), TLVAttribute(AttributeP2LifeValue, []byte{0x00, 0x46, 0x50, 0x00}),
+		TVAttribute(AttributeP2LifeType, LifeTypeSeconds), TVAttribute(AttributeP2LifeValue, 3600),
 	}}
 	suite, err := ParseESPTransform(transform)
-	if err != nil || suite.KeyBits != 256 || suite.Encapsulation != EncapsulationTransport {
+	if err != nil || suite.KeyBits != 256 || suite.Encapsulation != EncapsulationTransport || suite.LifetimeSeconds != 3600 || suite.LifetimeKilobytes != 4608000 {
 		t.Fatalf("suite=%#v err=%v", suite, err)
 	}
 }

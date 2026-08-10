@@ -22,10 +22,12 @@ type Phase1Transform struct {
 }
 
 type ESPTransform struct {
-	Encryption     uint8
-	Authentication uint16
-	Encapsulation  uint16
-	KeyBits        int
+	Encryption        uint8
+	Authentication    uint16
+	Encapsulation     uint16
+	KeyBits           int
+	LifetimeSeconds   uint32
+	LifetimeKilobytes uint32
 }
 
 // ParseESPTransform validates an ESP transform for the L2TP/IPsec transport
@@ -33,19 +35,46 @@ type ESPTransform struct {
 // encapsulation support.
 func ParseESPTransform(t Transform) (ESPTransform, error) {
 	values := make(map[uint16]uint32)
+	var lifetimeType uint32
+	var lifetimeSeconds, lifetimeKilobytes uint32
 	for _, attribute := range t.Attributes {
-		if _, duplicate := values[attribute.Type]; duplicate {
-			return ESPTransform{}, fmt.Errorf("%w: duplicate ESP attribute %d", ErrInvalidPayload, attribute.Type)
-		}
 		value, err := attributeUint32(attribute)
 		if err != nil {
 			return ESPTransform{}, err
 		}
+		if attribute.Type == AttributeP2LifeType {
+			if lifetimeType != 0 {
+				return ESPTransform{}, fmt.Errorf("%w: consecutive ESP lifetime types", ErrInvalidPayload)
+			}
+			lifetimeType = value
+			continue
+		}
+		if attribute.Type == AttributeP2LifeValue {
+			if lifetimeType == 0 {
+				return ESPTransform{}, fmt.Errorf("%w: ESP lifetime value without type", ErrInvalidPayload)
+			}
+			switch lifetimeType {
+			case uint32(LifeTypeSeconds):
+				lifetimeSeconds = value
+			case uint32(LifeTypeKilobytes):
+				lifetimeKilobytes = value
+			default:
+				return ESPTransform{}, fmt.Errorf("%w: ESP lifetime type %d", ErrUnsupportedTransform, lifetimeType)
+			}
+			lifetimeType = 0
+			continue
+		}
+		if _, duplicate := values[attribute.Type]; duplicate {
+			return ESPTransform{}, fmt.Errorf("%w: duplicate ESP attribute %d", ErrInvalidPayload, attribute.Type)
+		}
 		values[attribute.Type] = value
+	}
+	if lifetimeType != 0 {
+		return ESPTransform{}, fmt.Errorf("%w: ESP lifetime type without value", ErrInvalidPayload)
 	}
 	for kind := range values {
 		switch kind {
-		case AttributeP2LifeType, AttributeP2LifeValue, AttributeP2DHGroup, AttributeP2Encapsulation, AttributeP2Authentication, AttributeP2KeyLength:
+		case AttributeP2DHGroup, AttributeP2Encapsulation, AttributeP2Authentication, AttributeP2KeyLength:
 		default:
 			return ESPTransform{}, fmt.Errorf("%w: ESP attribute %d", ErrUnsupportedTransform, kind)
 		}
@@ -58,7 +87,10 @@ func ParseESPTransform(t Transform) (ESPTransform, error) {
 	if !ok || authentication != uint32(ESPAuthHMACSHA196) {
 		return ESPTransform{}, fmt.Errorf("%w: ESP authentication %d", ErrUnsupportedTransform, authentication)
 	}
-	suite := ESPTransform{Encryption: t.ID, Authentication: uint16(authentication), Encapsulation: uint16(encapsulation), KeyBits: int(values[AttributeP2KeyLength])}
+	if group := values[AttributeP2DHGroup]; group != 0 {
+		return ESPTransform{}, fmt.Errorf("%w: Quick Mode PFS group %d", ErrUnsupportedTransform, group)
+	}
+	suite := ESPTransform{Encryption: t.ID, Authentication: uint16(authentication), Encapsulation: uint16(encapsulation), KeyBits: int(values[AttributeP2KeyLength]), LifetimeSeconds: lifetimeSeconds, LifetimeKilobytes: lifetimeKilobytes}
 	switch suite.Encryption {
 	case TransformESPAES:
 		if suite.KeyBits != 128 && suite.KeyBits != 192 && suite.KeyBits != 256 {

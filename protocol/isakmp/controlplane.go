@@ -21,6 +21,7 @@ type ControlPlaneConfig struct {
 	MaxPhase1SAs     int
 	Phase1Lifetime   time.Duration
 	HandshakeTimeout time.Duration
+	QuickModeTimeout time.Duration
 }
 
 type ControlPlaneResult struct {
@@ -32,6 +33,7 @@ type controlSA struct {
 	peer          string
 	main          *MainModeResponder
 	quick         map[uint32]*QuickModeResponder
+	quickUpdated  map[uint32]time.Time
 	responses     map[string][]byte
 	responseOrder []string
 	updated       time.Time
@@ -60,7 +62,10 @@ func NewControlPlane(config ControlPlaneConfig) (*ControlPlane, error) {
 	if config.HandshakeTimeout == 0 {
 		config.HandshakeTimeout = 30 * time.Second
 	}
-	if config.HandshakeTimeout < 0 || config.Phase1Lifetime < 0 {
+	if config.QuickModeTimeout == 0 {
+		config.QuickModeTimeout = 10 * time.Second
+	}
+	if config.HandshakeTimeout < 0 || config.QuickModeTimeout < 0 || config.Phase1Lifetime < 0 {
 		return nil, ErrInvalidCryptoInput
 	}
 	return &ControlPlane{config: config, sas: make(map[Cookie]*controlSA)}, nil
@@ -105,7 +110,7 @@ func (c *ControlPlane) HandleDatagram(peer net.Addr, wire []byte, now time.Time)
 		if seconds := main.Transform().LifetimeSeconds; seconds != 0 && time.Duration(seconds)*time.Second < lifetime {
 			lifetime = time.Duration(seconds) * time.Second
 		}
-		runtime := &controlSA{peer: addressKey(peer), main: main, quick: make(map[uint32]*QuickModeResponder), responses: make(map[string][]byte), updated: now, expires: now.Add(lifetime)}
+		runtime := &controlSA{peer: addressKey(peer), main: main, quick: make(map[uint32]*QuickModeResponder), quickUpdated: make(map[uint32]time.Time), responses: make(map[string][]byte), updated: now, expires: now.Add(lifetime)}
 		runtime.cacheResponse(wire, reply)
 		c.sas[responderCookie] = runtime
 		return ControlPlaneResult{Reply: reply}, nil
@@ -132,15 +137,26 @@ func (c *ControlPlane) HandleDatagram(peer net.Addr, wire []byte, now time.Time)
 			quick, err = sa.main.NewQuickModeResponder(c.config.Random)
 			if err == nil {
 				sa.quick[packet.MessageID] = quick
+				sa.quickUpdated[packet.MessageID] = now
 			}
 		}
 		if err == nil {
 			reply, err = quick.Handle(wire)
 		}
+		if err != nil {
+			if quick != nil {
+				quick.Close()
+			}
+			delete(sa.quick, packet.MessageID)
+			delete(sa.quickUpdated, packet.MessageID)
+		}
 		if err == nil {
+			sa.quickUpdated[packet.MessageID] = now
 			if pair, ok := quick.Pair(); ok {
 				established = &pair
+				quick.Close()
 				delete(sa.quick, packet.MessageID)
+				delete(sa.quickUpdated, packet.MessageID)
 			}
 		}
 	default:
@@ -156,8 +172,18 @@ func (c *ControlPlane) HandleDatagram(peer net.Addr, wire []byte, now time.Time)
 
 func (c *ControlPlane) expire(now time.Time) {
 	for cookie, sa := range c.sas {
+		for messageID, quick := range sa.quick {
+			if now.Sub(sa.quickUpdated[messageID]) >= c.config.QuickModeTimeout {
+				quick.Close()
+				delete(sa.quick, messageID)
+				delete(sa.quickUpdated, messageID)
+			}
+		}
 		handshakeExpired := sa.main.State() != MainModeEstablished && now.Sub(sa.updated) >= c.config.HandshakeTimeout
 		if handshakeExpired || !now.Before(sa.expires) {
+			for _, quick := range sa.quick {
+				quick.Close()
+			}
 			sa.main.Close()
 			delete(c.sas, cookie)
 		}

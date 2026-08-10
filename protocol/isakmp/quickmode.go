@@ -13,6 +13,7 @@ const (
 	QuickModeAwaitProposal QuickModeState = iota
 	QuickModeAwaitConfirmation
 	QuickModeEstablished
+	QuickModeFailed
 )
 
 type QuickModeConfig struct {
@@ -55,6 +56,8 @@ func NewQuickModeResponder(config QuickModeConfig) (*QuickModeResponder, error) 
 	if config.NonceSize < 16 || config.NonceSize > 256 {
 		return nil, ErrInvalidCryptoInput
 	}
+	config.Secrets = cloneSecrets(config.Secrets)
+	config.LastPhase1Block = append([]byte(nil), config.LastPhase1Block...)
 	return &QuickModeResponder{config: config}, nil
 }
 
@@ -67,6 +70,14 @@ func (q *QuickModeResponder) Pair() (ESPPair, bool) {
 }
 
 func (q *QuickModeResponder) Handle(wire []byte) ([]byte, error) {
+	reply, err := q.handle(wire)
+	if err != nil {
+		q.fail()
+	}
+	return reply, err
+}
+
+func (q *QuickModeResponder) handle(wire []byte) ([]byte, error) {
 	packet, err := DecodePacket(wire)
 	if err != nil {
 		return nil, err
@@ -117,6 +128,10 @@ func (q *QuickModeResponder) handleProposal(packet Packet) ([]byte, error) {
 	if !ok || nonce.Kind != PayloadNonce || len(nonce.Data) < 16 {
 		return nil, ErrUnexpectedExchange
 	}
+	selectors, err := quickModeSelectors(payloads[3:])
+	if err != nil {
+		return nil, err
+	}
 	selectedSA, espTransform, outboundSPI, inboundSPI, err := selectESPsa(sa, q.config.Random)
 	if err != nil {
 		return nil, err
@@ -142,6 +157,7 @@ func (q *QuickModeResponder) handleProposal(packet Packet) ([]byte, error) {
 		Outbound: ESPDirectionalKeys{SPI: outboundSPI, EncryptionKey: append([]byte(nil), outKeymat[:espTransform.KeyBits/8]...), AuthenticationKey: append([]byte(nil), outKeymat[espTransform.KeyBits/8:]...)},
 	}
 	after := []Payload{selectedSA, DataPayload{Kind: PayloadNonce, Data: q.responderNonce}}
+	after = append(after, selectors...)
 	_, afterWire, err := MarshalPayloads(after)
 	if err != nil {
 		return nil, err
@@ -176,10 +192,71 @@ func (q *QuickModeResponder) handleConfirmation(packet Packet) ([]byte, error) {
 		return nil, fmt.Errorf("%w: HASH(3)", ErrInvalidCryptoInput)
 	}
 	q.state = QuickModeEstablished
+	q.releaseExchangeSecrets()
 	return nil, nil
 }
 
+// quickModeSelectors accepts either no explicit selectors or the IDci/IDcr
+// pair used by transport-mode L2TP/IPsec clients. The responder echoes the
+// accepted pair, binding it into HASH(2).
+func quickModeSelectors(payloads []Payload) ([]Payload, error) {
+	if len(payloads) == 0 {
+		return nil, nil
+	}
+	if len(payloads) != 2 {
+		return nil, ErrUnexpectedExchange
+	}
+	selectors := make([]Payload, 0, 2)
+	for _, payload := range payloads {
+		selector, ok := payload.(Identification)
+		if !ok || (selector.IDType != IDIPv4Address && selector.IDType != IDIPv4Subnet) || (selector.ProtocolID != 0 && selector.ProtocolID != 17) || (selector.Port != 0 && selector.Port != 1701) {
+			return nil, fmt.Errorf("%w: unsupported Quick Mode selector", ErrUnsupportedTransform)
+		}
+		want := 4
+		if selector.IDType == IDIPv4Subnet {
+			want = 8
+		}
+		if len(selector.Data) != want {
+			return nil, ErrInvalidPayload
+		}
+		selector.Data = append([]byte(nil), selector.Data...)
+		selectors = append(selectors, selector)
+	}
+	return selectors, nil
+}
+
+func (q *QuickModeResponder) fail() {
+	q.state = QuickModeFailed
+	q.Close()
+}
+
+func (q *QuickModeResponder) releaseExchangeSecrets() {
+	zeroBytes(q.config.Secrets.SKEYID)
+	zeroBytes(q.config.Secrets.SKEYIDd)
+	zeroBytes(q.config.Secrets.SKEYIDa)
+	zeroBytes(q.config.Secrets.SKEYIDe)
+	zeroBytes(q.config.Secrets.Key)
+	zeroBytes(q.config.LastPhase1Block)
+	zeroBytes(q.initiatorNonce)
+	zeroBytes(q.responderNonce)
+	q.cipher = nil
+}
+
+// Close clears both exchange state and any not-yet-installed ESP keys.
+func (q *QuickModeResponder) Close() {
+	q.releaseExchangeSecrets()
+	zeroBytes(q.pair.Inbound.EncryptionKey)
+	zeroBytes(q.pair.Inbound.AuthenticationKey)
+	zeroBytes(q.pair.Outbound.EncryptionKey)
+	zeroBytes(q.pair.Outbound.AuthenticationKey)
+	q.pair = ESPPair{}
+	q.state = QuickModeFailed
+}
+
 func selectESPsa(sa SecurityAssociation, random io.Reader) (SecurityAssociation, ESPTransform, uint32, uint32, error) {
+	if sa.DOI != DOIIPsec || sa.Situation != SituationIdentityOnly {
+		return SecurityAssociation{}, ESPTransform{}, 0, 0, ErrUnsupportedTransform
+	}
 	for _, proposal := range sa.Proposals {
 		if proposal.ProtocolID != ProtocolESP || len(proposal.SPI) != 4 {
 			continue
