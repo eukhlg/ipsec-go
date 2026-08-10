@@ -3,6 +3,7 @@ package isakmp
 import (
 	"bytes"
 	"encoding/binary"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -115,5 +116,33 @@ func TestQuickModeSelectsNATTOnlyAfterNegotiation(t *testing.T) {
 	}
 	if _, selected, _, _, err := selectESPsa(sa, EncapsulationNATTTransport, bytes.NewReader(bytes.Repeat([]byte{1}, 32))); err != nil || selected.Encapsulation != EncapsulationNATTTransport {
 		t.Fatalf("selected=%#v error=%v", selected, err)
+	}
+}
+
+func TestQuickModeAcceptsWindowsNATOATail(t *testing.T) {
+	idci := Identification{IDType: IDIPv4Address, ProtocolID: 17, Port: 1701, Data: []byte{10, 0, 0, 2}}
+	idcr := Identification{IDType: IDIPv4Address, ProtocolID: 17, Port: 1701, Data: []byte{10, 0, 0, 1}}
+	tail := []Payload{
+		idci, idcr,
+		NATOriginalAddress{Kind: PayloadNATOA, IDType: IDIPv4Address, Address: []byte{192, 168, 1, 10}},
+		NATOriginalAddress{Kind: PayloadNATOA, IDType: IDIPv4Address, Address: []byte{203, 0, 113, 1}},
+	}
+	selectors, wantsNATOA, err := quickModeTail(tail)
+	if err != nil || !wantsNATOA || len(selectors) != 2 {
+		t.Fatalf("selectors=%#v wants_natoa=%t err=%v", selectors, wantsNATOA, err)
+	}
+	q := QuickModeResponder{config: QuickModeConfig{
+		OriginalInitiator: netip.MustParseAddr("198.51.100.20"),
+		OriginalResponder: netip.MustParseAddr("203.0.113.1"),
+	}}
+	response, err := q.responderNATOA()
+	if err != nil || len(response) != 2 {
+		t.Fatalf("response=%#v err=%v", response, err)
+	}
+	if got := response[0].(NATOriginalAddress).Address; !bytes.Equal(got, []byte{198, 51, 100, 20}) {
+		t.Fatalf("initiator NAT-OA=%v", got)
+	}
+	if got := response[1].(NATOriginalAddress).Address; !bytes.Equal(got, []byte{203, 0, 113, 1}) {
+		t.Fatalf("responder NAT-OA=%v", got)
 	}
 }

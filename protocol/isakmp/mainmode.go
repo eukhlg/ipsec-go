@@ -93,7 +93,7 @@ func (r *MainModeResponder) NewQuickModeResponder(random io.Reader) (*QuickModeR
 	if r.NATTraversal() {
 		encapsulation = EncapsulationNATTTransport
 	}
-	return NewQuickModeResponder(QuickModeConfig{Transform: r.transform, Secrets: r.secrets, InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, LastPhase1Block: r.cipher.CurrentIV(), Random: random, Encapsulation: encapsulation, Lifetime: r.config.ESPLifetime})
+	return NewQuickModeResponder(QuickModeConfig{Transform: r.transform, Secrets: r.secrets, InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, LastPhase1Block: r.cipher.CurrentIV(), Random: random, Encapsulation: encapsulation, Lifetime: r.config.ESPLifetime, OriginalInitiator: r.config.RemoteEndpoint.Addr(), OriginalResponder: r.config.LocalEndpoint.Addr()})
 }
 
 func (r *MainModeResponder) Handle(wire []byte) ([]byte, error) {

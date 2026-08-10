@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net/netip"
 	"time"
 )
 
@@ -26,6 +27,8 @@ type QuickModeConfig struct {
 	NonceSize                        int
 	Encapsulation                    uint16
 	Lifetime                         time.Duration
+	OriginalInitiator                netip.Addr
+	OriginalResponder                netip.Addr
 }
 
 type ESPDirectionalKeys struct {
@@ -141,7 +144,7 @@ func (q *QuickModeResponder) handleProposal(packet Packet) ([]byte, error) {
 	if !ok || nonce.Kind != PayloadNonce || len(nonce.Data) < 16 {
 		return nil, fmt.Errorf("%w: quick mode third payload is not a valid nonce", ErrUnexpectedExchange)
 	}
-	selectors, err := quickModeSelectors(payloads[3:])
+	selectors, wantsNATOA, err := quickModeTail(payloads[3:])
 	if err != nil {
 		return nil, err
 	}
@@ -188,6 +191,13 @@ func (q *QuickModeResponder) handleProposal(packet Packet) ([]byte, error) {
 	}
 	after := []Payload{selectedSA, DataPayload{Kind: PayloadNonce, Data: q.responderNonce}}
 	after = append(after, selectors...)
+	if wantsNATOA && espTransform.Encapsulation == EncapsulationNATTTransport {
+		natoa, err := q.responderNATOA()
+		if err != nil {
+			return nil, err
+		}
+		after = append(after, natoa...)
+	}
 	_, afterWire, err := MarshalPayloads(after)
 	if err != nil {
 		return nil, err
@@ -226,33 +236,57 @@ func (q *QuickModeResponder) handleConfirmation(packet Packet) ([]byte, error) {
 	return nil, nil
 }
 
-// quickModeSelectors accepts either no explicit selectors or the IDci/IDcr
-// pair used by transport-mode L2TP/IPsec clients. The responder echoes the
-// accepted pair, binding it into HASH(2).
-func quickModeSelectors(payloads []Payload) ([]Payload, error) {
+// quickModeTail accepts the RFC 2409 IDci/IDcr selectors followed by the
+// RFC 3947 NAT-OAi/NAT-OAr pair used with UDP-encapsulated transport mode.
+func quickModeTail(payloads []Payload) ([]Payload, bool, error) {
 	if len(payloads) == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
-	if len(payloads) != 2 {
-		return nil, ErrUnexpectedExchange
+	selectorCount := 0
+	if _, ok := payloads[0].(Identification); ok {
+		selectorCount = 2
+	}
+	if len(payloads) != selectorCount && len(payloads) != selectorCount+2 {
+		return nil, false, fmt.Errorf("%w: unsupported Quick Mode tail with %d payloads", ErrUnexpectedExchange, len(payloads))
 	}
 	selectors := make([]Payload, 0, 2)
-	for _, payload := range payloads {
+	for _, payload := range payloads[:selectorCount] {
 		selector, ok := payload.(Identification)
 		if !ok || (selector.IDType != IDIPv4Address && selector.IDType != IDIPv4Subnet) || (selector.ProtocolID != 0 && selector.ProtocolID != 17) || (selector.Port != 0 && selector.Port != 1701) {
-			return nil, fmt.Errorf("%w: unsupported Quick Mode selector", ErrUnsupportedTransform)
+			return nil, false, fmt.Errorf("%w: unsupported Quick Mode selector", ErrUnsupportedTransform)
 		}
 		want := 4
 		if selector.IDType == IDIPv4Subnet {
 			want = 8
 		}
 		if len(selector.Data) != want {
-			return nil, ErrInvalidPayload
+			return nil, false, ErrInvalidPayload
 		}
 		selector.Data = append([]byte(nil), selector.Data...)
 		selectors = append(selectors, selector)
 	}
-	return selectors, nil
+	wantsNATOA := len(payloads) == selectorCount+2
+	if wantsNATOA {
+		for _, payload := range payloads[selectorCount:] {
+			natoa, ok := payload.(NATOriginalAddress)
+			if !ok || natoa.IDType != IDIPv4Address || len(natoa.Address) != 4 {
+				return nil, false, fmt.Errorf("%w: invalid NAT-OA pair", ErrInvalidPayload)
+			}
+		}
+	}
+	return selectors, wantsNATOA, nil
+}
+
+func (q *QuickModeResponder) responderNATOA() ([]Payload, error) {
+	initiator, responder := q.config.OriginalInitiator.Unmap(), q.config.OriginalResponder.Unmap()
+	if !initiator.Is4() || !responder.Is4() {
+		return nil, fmt.Errorf("%w: missing IPv4 NAT-OA endpoints", ErrInvalidCryptoInput)
+	}
+	initiator4, responder4 := initiator.As4(), responder.As4()
+	return []Payload{
+		NATOriginalAddress{Kind: PayloadNATOA, IDType: IDIPv4Address, Address: append([]byte(nil), initiator4[:]...)},
+		NATOriginalAddress{Kind: PayloadNATOA, IDType: IDIPv4Address, Address: append([]byte(nil), responder4[:]...)},
+	}, nil
 }
 
 func (q *QuickModeResponder) fail() {
