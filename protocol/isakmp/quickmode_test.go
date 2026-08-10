@@ -146,3 +146,16 @@ func TestQuickModeAcceptsWindowsNATOATail(t *testing.T) {
 		t.Fatalf("responder NAT-OA=%v", got)
 	}
 }
+
+func TestQuickModeAcceptsMacOSIPv4RangeSelectors(t *testing.T) {
+	idci := Identification{IDType: IDIPv4Range, ProtocolID: 17, Port: 1701, Data: []byte{10, 0, 0, 2, 10, 0, 0, 2}}
+	idcr := Identification{IDType: IDIPv4Range, ProtocolID: 17, Port: 1701, Data: []byte{203, 0, 113, 1, 203, 0, 113, 1}}
+	selectors, wantsNATOA, err := quickModeTail([]Payload{idci, idcr})
+	if err != nil || wantsNATOA || len(selectors) != 2 {
+		t.Fatalf("selectors=%#v wants_natoa=%t err=%v", selectors, wantsNATOA, err)
+	}
+	idci.Data = []byte{10, 0, 0, 3, 10, 0, 0, 2}
+	if _, _, err := quickModeTail([]Payload{idci, idcr}); err == nil {
+		t.Fatal("accepted reversed IPv4 range")
+	}
+}

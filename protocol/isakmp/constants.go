@@ -120,4 +120,5 @@ const (
 	IDFQDN        uint8 = 2
 	IDUserFQDN    uint8 = 3
 	IDIPv4Subnet  uint8 = 4
+	IDIPv4Range   uint8 = 7
 )

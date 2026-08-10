@@ -252,15 +252,27 @@ func quickModeTail(payloads []Payload) ([]Payload, bool, error) {
 	selectors := make([]Payload, 0, 2)
 	for _, payload := range payloads[:selectorCount] {
 		selector, ok := payload.(Identification)
-		if !ok || (selector.IDType != IDIPv4Address && selector.IDType != IDIPv4Subnet) || (selector.ProtocolID != 0 && selector.ProtocolID != 17) || (selector.Port != 0 && selector.Port != 1701) {
-			return nil, false, fmt.Errorf("%w: unsupported Quick Mode selector", ErrUnsupportedTransform)
+		if !ok {
+			return nil, false, fmt.Errorf("%w: Quick Mode selector is not an ID payload", ErrUnsupportedTransform)
 		}
-		want := 4
-		if selector.IDType == IDIPv4Subnet {
-			want = 8
+		if selector.ProtocolID != 0 && selector.ProtocolID != 17 || selector.Port != 0 && selector.Port != 1701 {
+			return nil, false, fmt.Errorf("%w: Quick Mode selector type=%d protocol=%d port=%d bytes=%d", ErrUnsupportedTransform, selector.IDType, selector.ProtocolID, selector.Port, len(selector.Data))
 		}
-		if len(selector.Data) != want {
-			return nil, false, ErrInvalidPayload
+		switch selector.IDType {
+		case IDIPv4Address:
+			if len(selector.Data) != 4 {
+				return nil, false, fmt.Errorf("%w: IPv4 address selector bytes=%d", ErrInvalidPayload, len(selector.Data))
+			}
+		case IDIPv4Subnet:
+			if len(selector.Data) != 8 {
+				return nil, false, fmt.Errorf("%w: IPv4 subnet selector bytes=%d", ErrInvalidPayload, len(selector.Data))
+			}
+		case IDIPv4Range:
+			if len(selector.Data) != 8 || binary.BigEndian.Uint32(selector.Data[:4]) > binary.BigEndian.Uint32(selector.Data[4:]) {
+				return nil, false, fmt.Errorf("%w: invalid IPv4 range selector bytes=%d", ErrInvalidPayload, len(selector.Data))
+			}
+		default:
+			return nil, false, fmt.Errorf("%w: Quick Mode selector type=%d protocol=%d port=%d bytes=%d", ErrUnsupportedTransform, selector.IDType, selector.ProtocolID, selector.Port, len(selector.Data))
 		}
 		selector.Data = append([]byte(nil), selector.Data...)
 		selectors = append(selectors, selector)
