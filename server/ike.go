@@ -17,6 +17,7 @@ type IKEServer struct {
 	ControlPlane *isakmp.ControlPlane
 	Established  IKEEstablishedHandler
 	Lifecycle    IKELifecycleHandler
+	Debugf       func(string, ...any)
 }
 
 // InstallESPRegistry wires completed Quick Mode pairs into an ESP registry.
@@ -68,6 +69,7 @@ func (s *IKEServer) Serve(ctx context.Context) error {
 		}
 		result, err := s.ControlPlane.HandleDatagram(peer, buffer[:n], time.Now())
 		if err != nil {
+			s.debug("ike udp/500 drop peer=%s bytes=%d error=%v", peer, n, err)
 			s.handleMaintenance(ctx)
 			continue
 		} // Untrusted malformed datagrams never stop UDP/500.
@@ -75,6 +77,7 @@ func (s *IKEServer) Serve(ctx context.Context) error {
 			if _, err := s.Conn.WriteTo(result.Reply, peer); err != nil {
 				return err
 			}
+			s.debug("ike udp/500 tx peer=%s bytes=%d", peer, len(result.Reply))
 		}
 		if result.Established != nil && s.Established != nil {
 			s.Established(ctx, peer, *result.Established)
@@ -83,6 +86,12 @@ func (s *IKEServer) Serve(ctx context.Context) error {
 			s.Lifecycle(ctx, result.Lifecycle)
 		}
 		s.handleMaintenance(ctx)
+	}
+}
+
+func (s *IKEServer) debug(format string, args ...any) {
+	if s.Debugf != nil {
+		s.Debugf(format, args...)
 	}
 }
 

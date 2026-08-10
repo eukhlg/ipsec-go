@@ -74,3 +74,30 @@ func TestControlPlaneShutdownBuildsDelete(t *testing.T) {
 		t.Fatalf("packet=%#v error=%v", packet, err)
 	}
 }
+
+func TestControlPlaneProactiveDPDExpiresSilentPeer(t *testing.T) {
+	main := testEstablishedMain(t)
+	main.capabilities.DPD = true
+	peer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 500}
+	now := time.Unix(100, 0)
+	sa := &controlSA{peer: addressKey(peer), peerAddr: peer, main: main, quick: make(map[uint32]*QuickModeResponder), quickUpdated: make(map[uint32]time.Time), responses: make(map[string][]byte), expires: now.Add(time.Hour)}
+	control := &ControlPlane{config: ControlPlaneConfig{Random: bytes.NewReader(bytes.Repeat([]byte{0x66}, 256)), DPDInterval: 20 * time.Second}, sas: map[Cookie]*controlSA{main.responderCookie: sa}}
+	if got := control.PollDPD(now); len(got) != 0 {
+		t.Fatalf("initial probes=%d", len(got))
+	}
+	probes := control.PollDPD(now.Add(20 * time.Second))
+	if len(probes) != 1 {
+		t.Fatalf("probes=%d", len(probes))
+	}
+	_, payloads, err := main.DecodeInformational(probes[0].Payload)
+	if err != nil || payloads[0].(Notification).MessageType != NotifyRThere {
+		t.Fatalf("payloads=%#v error=%v", payloads, err)
+	}
+	_ = control.PollDPD(now.Add(40 * time.Second))
+	_ = control.PollDPD(now.Add(60 * time.Second))
+	_ = control.PollDPD(now.Add(80 * time.Second))
+	events := control.Maintain(now.Add(80 * time.Second))
+	if control.SACount() != 0 || len(events) != 1 || events[0].Type != LifecycleExpireIKE {
+		t.Fatalf("SAs=%d events=%#v", control.SACount(), events)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"testing"
+	"time"
 )
 
 func TestQuickModeResponderTranscript(t *testing.T) {
@@ -11,7 +12,7 @@ func TestQuickModeResponderTranscript(t *testing.T) {
 	secrets := Phase1Secrets{SKEYIDa: bytes.Repeat([]byte{0x11}, 20), SKEYIDd: bytes.Repeat([]byte{0x22}, 20), Key: bytes.Repeat([]byte{0x33}, 16)}
 	ci, cr := Cookie{1}, Cookie{2}
 	lastBlock := bytes.Repeat([]byte{0x44}, 16)
-	responder, err := NewQuickModeResponder(QuickModeConfig{Transform: phase1, Secrets: secrets, InitiatorCookie: ci, ResponderCookie: cr, LastPhase1Block: lastBlock, Random: bytes.NewReader(bytes.Repeat([]byte{0x55}, 512))})
+	responder, err := NewQuickModeResponder(QuickModeConfig{Transform: phase1, Secrets: secrets, InitiatorCookie: ci, ResponderCookie: cr, LastPhase1Block: lastBlock, Random: bytes.NewReader(bytes.Repeat([]byte{0x55}, 512)), Lifetime: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +70,7 @@ func TestQuickModeResponderTranscript(t *testing.T) {
 	if !ok {
 		t.Fatal("pair unavailable")
 	}
-	if pair.Outbound.SPI != binary.BigEndian.Uint32(offeredSPI) || pair.Inbound.SPI != binary.BigEndian.Uint32(selected.Proposals[0].SPI) || len(pair.Inbound.EncryptionKey) != 16 || len(pair.Inbound.AuthenticationKey) != 20 {
+	if pair.Outbound.SPI != binary.BigEndian.Uint32(offeredSPI) || pair.Inbound.SPI != binary.BigEndian.Uint32(selected.Proposals[0].SPI) || len(pair.Inbound.EncryptionKey) != 16 || len(pair.Inbound.AuthenticationKey) != 20 || pair.Transform.LifetimeSeconds != 3600 {
 		t.Fatalf("pair=%#v", pair)
 	}
 }

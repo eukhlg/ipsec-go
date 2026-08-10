@@ -3,8 +3,10 @@ package isakmp
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 )
@@ -98,5 +100,48 @@ func TestControlPlaneAllowsAuthenticatedNATTPortMigration(t *testing.T) {
 	wrongIP := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 21), Port: 4500}
 	if _, err := control.HandleNATTDatagram(wrongIP, wire, time.Now()); !errors.Is(err, ErrUnknownSA) {
 		t.Fatalf("wrong-IP migration error=%v", err)
+	}
+}
+
+func TestControlPlaneHalfOpenAndPerPeerLimits(t *testing.T) {
+	sa := SecurityAssociation{DOI: DOIIPsec, Situation: SituationIdentityOnly, Proposals: []Proposal{{Number: 1, ProtocolID: ProtocolIKE, Transforms: []Transform{phase1Transform(EncryptionAESCBC, HashSHA1, DHGroup2, 128)}}}}
+	request := func(cookie byte) []byte {
+		wire, _ := (Packet{InitiatorCookie: Cookie{cookie}, Exchange: ExchangeIdentityProtect, Payloads: []Payload{sa}}).MarshalBinary()
+		return wire
+	}
+	newControl := func(halfOpen, perPeer int) *ControlPlane {
+		control, err := NewControlPlane(ControlPlaneConfig{PreSharedKey: []byte("psk"), ResponderID: Identification{IDType: IDIPv4Address, Data: []byte{192, 0, 2, 1}}, Random: bytes.NewReader(bytes.Repeat([]byte{0x55}, 1024)), MaxPhase1SAs: 10, MaxHalfOpen: halfOpen, MaxSAsPerPeer: perPeer})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return control
+	}
+	now := time.Unix(1, 0)
+	firstPeer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 500}
+	otherPeer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 11), Port: 500}
+	half := newControl(1, 0)
+	_, _ = half.HandleDatagram(firstPeer, request(1), now)
+	if _, err := half.HandleDatagram(otherPeer, request(2), now); !errors.Is(err, ErrSALimit) {
+		t.Fatalf("half-open error=%v", err)
+	}
+	perPeer := newControl(0, 1)
+	_, _ = perPeer.HandleDatagram(firstPeer, request(3), now)
+	if _, err := perPeer.HandleDatagram(&net.UDPAddr{IP: firstPeer.IP, Port: 501}, request(4), now); !errors.Is(err, ErrSALimit) {
+		t.Fatalf("per-peer error=%v", err)
+	}
+}
+
+func TestControlPlaneSanitizedDebugTrace(t *testing.T) {
+	var logs []string
+	control, err := NewControlPlane(ControlPlaneConfig{PreSharedKey: []byte("super-secret-psk"), ResponderID: Identification{IDType: IDIPv4Address, Data: []byte{192, 0, 2, 1}}, Random: bytes.NewReader(bytes.Repeat([]byte{0x44}, 512)), Debugf: func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sa := SecurityAssociation{DOI: DOIIPsec, Situation: SituationIdentityOnly, Proposals: []Proposal{{Number: 1, ProtocolID: ProtocolIKE, Transforms: []Transform{phase1Transform(EncryptionAESCBC, HashSHA1, DHGroup2, 128)}}}}
+	wire, _ := (Packet{InitiatorCookie: Cookie{1}, Exchange: ExchangeIdentityProtect, Payloads: []Payload{sa}}).MarshalBinary()
+	_, _ = control.HandleDatagram(&net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 500}, wire, time.Now())
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "ike rx") || !strings.Contains(joined, "state=await-key-exchange") || strings.Contains(joined, "super-secret-psk") {
+		t.Fatalf("logs=%q", joined)
 	}
 }

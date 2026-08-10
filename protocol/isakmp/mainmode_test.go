@@ -201,3 +201,14 @@ func TestMainModeEchoesDPDCapability(t *testing.T) {
 		t.Fatalf("payloads=%#v capabilities=%#v", packet.Payloads, responder.Capabilities())
 	}
 }
+
+func TestMainModeForceNATTForCapablePeer(t *testing.T) {
+	responder := &MainModeResponder{config: MainModeConfig{ForceNATT: true}, capabilities: PeerCapabilities{NATTRFC3947: true}}
+	if !responder.NATTraversal() {
+		t.Fatal("force NAT-T did not select UDP encapsulation")
+	}
+	responder.capabilities.NATTRFC3947 = false
+	if responder.NATTraversal() {
+		t.Fatal("force NAT-T selected encapsulation for an incapable peer")
+	}
+}

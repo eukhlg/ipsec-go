@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"time"
 )
 
 var ErrUnexpectedExchange = errors.New("isakmp: unexpected exchange message")
@@ -28,6 +29,8 @@ type MainModeConfig struct {
 	LocalEndpoint, RemoteEndpoint netip.AddrPort
 	Random                        io.Reader
 	NonceSize                     int
+	ForceNATT                     bool
+	ESPLifetime                   time.Duration
 }
 
 type MainModeResponder struct {
@@ -73,7 +76,7 @@ func (r *MainModeResponder) Cookies() (Cookie, Cookie)          { return r.initi
 func (r *MainModeResponder) Capabilities() PeerCapabilities     { return r.capabilities }
 func (r *MainModeResponder) NATDetection() (NATDetection, bool) { return r.nat, r.natDetectionComplete }
 func (r *MainModeResponder) NATTraversal() bool {
-	return r.capabilities.NATTRFC3947 && r.natDetectionComplete && (r.nat.LocalNAT || r.nat.RemoteNAT)
+	return r.capabilities.NATTRFC3947 && (r.config.ForceNATT || (r.natDetectionComplete && (r.nat.LocalNAT || r.nat.RemoteNAT)))
 }
 func (r *MainModeResponder) Secrets() (Phase1Secrets, bool) {
 	if r.state != MainModeEstablished {
@@ -90,7 +93,7 @@ func (r *MainModeResponder) NewQuickModeResponder(random io.Reader) (*QuickModeR
 	if r.NATTraversal() {
 		encapsulation = EncapsulationNATTTransport
 	}
-	return NewQuickModeResponder(QuickModeConfig{Transform: r.transform, Secrets: r.secrets, InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, LastPhase1Block: r.cipher.CurrentIV(), Random: random, Encapsulation: encapsulation})
+	return NewQuickModeResponder(QuickModeConfig{Transform: r.transform, Secrets: r.secrets, InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, LastPhase1Block: r.cipher.CurrentIV(), Random: random, Encapsulation: encapsulation, Lifetime: r.config.ESPLifetime})
 }
 
 func (r *MainModeResponder) Handle(wire []byte) ([]byte, error) {
@@ -146,7 +149,7 @@ func (r *MainModeResponder) handleSA(packet Packet, wire []byte) ([]byte, error)
 	if r.capabilities.MicrosoftL2TP {
 		replyPayloads = append(replyPayloads, DataPayload{Kind: PayloadVendorID, Data: VendorMicrosoftL2TP})
 	}
-	if r.capabilities.NATTRFC3947 {
+	if r.capabilities.NATTRFC3947 || r.config.ForceNATT {
 		replyPayloads = append(replyPayloads, DataPayload{Kind: PayloadVendorID, Data: VendorNATTRFC3947})
 	}
 	if r.capabilities.DPD {

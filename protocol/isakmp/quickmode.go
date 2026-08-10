@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"time"
 )
 
 type QuickModeState uint8
@@ -24,6 +25,7 @@ type QuickModeConfig struct {
 	Random                           io.Reader
 	NonceSize                        int
 	Encapsulation                    uint16
+	Lifetime                         time.Duration
 }
 
 type ESPDirectionalKeys struct {
@@ -143,6 +145,23 @@ func (q *QuickModeResponder) handleProposal(packet Packet) ([]byte, error) {
 	selectedSA, espTransform, outboundSPI, inboundSPI, err := selectESPsa(sa, q.config.Encapsulation, q.config.Random)
 	if err != nil {
 		return nil, err
+	}
+	if q.config.Lifetime > 0 {
+		seconds := uint32(q.config.Lifetime / time.Second)
+		if seconds == 0 {
+			seconds = 1
+		}
+		if espTransform.LifetimeSeconds == 0 || seconds < espTransform.LifetimeSeconds {
+			espTransform.LifetimeSeconds = seconds
+			selected := &selectedSA.Proposals[0].Transforms[0]
+			attributes := selected.Attributes[:0]
+			for _, attribute := range selected.Attributes {
+				if attribute.Type != AttributeP2LifeType && attribute.Type != AttributeP2LifeValue {
+					attributes = append(attributes, attribute)
+				}
+			}
+			selected.Attributes = append(attributes, TVAttribute(AttributeP2LifeType, LifeTypeSeconds), TLVAttribute(AttributeP2LifeValue, uint32Bytes(seconds)))
+		}
 	}
 	q.initiatorNonce = append([]byte(nil), nonce.Data...)
 	q.responderNonce = make([]byte, q.config.NonceSize)

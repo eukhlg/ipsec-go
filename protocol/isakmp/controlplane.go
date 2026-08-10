@@ -24,7 +24,13 @@ type ControlPlaneConfig struct {
 	ResponderEndpoint netip.AddrPort
 	Random            io.Reader
 	MaxPhase1SAs      int
+	MaxHalfOpen       int
+	MaxSAsPerPeer     int
 	Phase1Lifetime    time.Duration
+	ESPLifetime       time.Duration
+	DPDInterval       time.Duration
+	ForceNATT         bool
+	Debugf            func(string, ...any)
 	HandshakeTimeout  time.Duration
 	QuickModeTimeout  time.Duration
 }
@@ -56,17 +62,21 @@ type ControlDatagram struct {
 }
 
 type controlSA struct {
-	peer          string
-	peerIP        netip.Addr
-	peerAddr      net.Addr
-	natt          bool
-	main          *MainModeResponder
-	quick         map[uint32]*QuickModeResponder
-	quickUpdated  map[uint32]time.Time
-	responses     map[string][]byte
-	responseOrder []string
-	updated       time.Time
-	expires       time.Time
+	peer           string
+	peerIP         netip.Addr
+	peerAddr       net.Addr
+	natt           bool
+	main           *MainModeResponder
+	quick          map[uint32]*QuickModeResponder
+	quickUpdated   map[uint32]time.Time
+	responses      map[string][]byte
+	responseOrder  []string
+	updated        time.Time
+	expires        time.Time
+	nextDPD        time.Time
+	dpdSequence    uint32
+	dpdOutstanding bool
+	dpdFailures    int
 }
 
 type ControlPlane struct {
@@ -89,7 +99,7 @@ func NewControlPlane(config ControlPlaneConfig) (*ControlPlane, error) {
 	if config.Random == nil {
 		config.Random = rand.Reader
 	}
-	if config.MaxPhase1SAs < 0 {
+	if config.MaxPhase1SAs < 0 || config.MaxHalfOpen < 0 || config.MaxSAsPerPeer < 0 || config.ESPLifetime < 0 || config.DPDInterval < 0 {
 		return nil, ErrInvalidCryptoInput
 	}
 	if config.Phase1Lifetime == 0 {
@@ -122,8 +132,10 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 	defer c.mu.Unlock()
 	packet, err := DecodePacket(wire)
 	if err != nil {
+		c.debug("ike decode rejected peer=%s bytes=%d error=%v", peer, len(wire), err)
 		return ControlPlaneResult{}, err
 	}
+	c.debug("ike rx peer=%s exchange=%d message_id=%08x flags=%02x initiator_cookie=%x responder_cookie=%x bytes=%d natt=%t", peer, packet.Exchange, packet.MessageID, packet.Flags, packet.InitiatorCookie, packet.ResponderCookie, len(wire), viaNATT)
 	c.expire(now)
 	if isZeroCookie(packet.ResponderCookie) {
 		if packet.Exchange != ExchangeIdentityProtect || packet.MessageID != 0 {
@@ -137,14 +149,24 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 				}
 			}
 		}
-		if len(c.sas) >= c.config.MaxPhase1SAs {
-			return ControlPlaneResult{}, ErrSALimit
-		}
 		remoteEndpoint, ok := addressPort(peer)
 		if c.config.ResponderEndpoint.IsValid() && !ok {
 			return ControlPlaneResult{}, ErrUnknownSA
 		}
-		main, err := NewMainModeResponder(MainModeConfig{PreSharedKey: c.config.PreSharedKey, ResponderID: c.config.ResponderID, LocalEndpoint: c.config.ResponderEndpoint, RemoteEndpoint: remoteEndpoint, Random: c.config.Random})
+		halfOpen, perPeer := 0, 0
+		for _, existing := range c.sas {
+			if existing.main.State() != MainModeEstablished {
+				halfOpen++
+			}
+			if remoteEndpoint.IsValid() && existing.peerIP == remoteEndpoint.Addr() {
+				perPeer++
+			}
+		}
+		if len(c.sas) >= c.config.MaxPhase1SAs || (c.config.MaxHalfOpen > 0 && halfOpen >= c.config.MaxHalfOpen) || (c.config.MaxSAsPerPeer > 0 && perPeer >= c.config.MaxSAsPerPeer) {
+			c.debug("ike SA limit rejected peer=%s total=%d half_open=%d per_peer=%d limits=%d/%d/%d", peer, len(c.sas), halfOpen, perPeer, c.config.MaxPhase1SAs, c.config.MaxHalfOpen, c.config.MaxSAsPerPeer)
+			return ControlPlaneResult{}, ErrSALimit
+		}
+		main, err := NewMainModeResponder(MainModeConfig{PreSharedKey: c.config.PreSharedKey, ResponderID: c.config.ResponderID, LocalEndpoint: c.config.ResponderEndpoint, RemoteEndpoint: remoteEndpoint, Random: c.config.Random, ForceNATT: c.config.ForceNATT, ESPLifetime: c.config.ESPLifetime})
 		if err != nil {
 			return ControlPlaneResult{}, err
 		}
@@ -163,6 +185,8 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 		runtime := &controlSA{peer: addressKey(peer), peerIP: remoteEndpoint.Addr(), peerAddr: cloneNetAddr(peer), natt: viaNATT, main: main, quick: make(map[uint32]*QuickModeResponder), quickUpdated: make(map[uint32]time.Time), responses: make(map[string][]byte), updated: now, expires: now.Add(lifetime)}
 		runtime.cacheResponse(wire, reply)
 		c.sas[responderCookie] = runtime
+		selected := main.Transform()
+		c.debug("ike main state peer=%s state=await-key-exchange responder_cookie=%x encryption=%d hash=%d dh=%d key_bits=%d lifetime=%ds", peer, responderCookie, selected.Encryption, selected.Hash, selected.DHGroup, selected.KeyBits, selected.LifetimeSeconds)
 		return ControlPlaneResult{Reply: reply}, nil
 	}
 	sa := c.sas[packet.ResponderCookie]
@@ -176,6 +200,7 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 			return ControlPlaneResult{}, ErrUnknownSA
 		}
 		migratePeer = true
+		c.debug("natt migration candidate peer=%s responder_cookie=%x", peer, packet.ResponderCookie)
 	}
 	if reply, ok := sa.responses[string(wire)]; ok {
 		if migratePeer {
@@ -216,6 +241,7 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 			sa.quickUpdated[packet.MessageID] = now
 			if pair, ok := quick.Pair(); ok {
 				established = &pair
+				c.debug("quick established peer=%s message_id=%08x inbound_spi=%08x outbound_spi=%08x encryption=%d key_bits=%d encapsulation=%d lifetime=%ds", peer, packet.MessageID, pair.Inbound.SPI, pair.Outbound.SPI, pair.Transform.Encryption, pair.Transform.KeyBits, pair.Transform.Encapsulation, pair.Transform.LifetimeSeconds)
 				quick.Close()
 				delete(sa.quick, packet.MessageID)
 				delete(sa.quickUpdated, packet.MessageID)
@@ -226,6 +252,10 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 		reply, lifecycle, err = c.handleInformational(sa, packet.ResponderCookie, wire)
 		if err == nil {
 			sa.updated = now
+			sa.dpdOutstanding, sa.dpdFailures = false, 0
+			if c.config.DPDInterval > 0 {
+				sa.nextDPD = now.Add(c.config.DPDInterval)
+			}
 			if len(lifecycle) != 0 {
 				for _, event := range lifecycle {
 					if event.Type == LifecycleDeleteIKE {
@@ -247,8 +277,16 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 		sa.peer = addressKey(peer)
 		sa.peerAddr, sa.natt = cloneNetAddr(peer), true
 	}
+	if sa.main.State() == MainModeEstablished {
+		nat, complete := sa.main.NATDetection()
+		c.debug("ike main established peer=%s responder_cookie=%x natt=%t nat_detection_complete=%t local_nat=%t remote_nat=%t", peer, packet.ResponderCookie, sa.main.NATTraversal(), complete, nat.LocalNAT, nat.RemoteNAT)
+	}
 	sa.cacheResponse(wire, reply)
 	sa.updated = now
+	sa.dpdOutstanding, sa.dpdFailures = false, 0
+	if c.config.DPDInterval > 0 {
+		sa.nextDPD = now.Add(c.config.DPDInterval)
+	}
 	return ControlPlaneResult{Reply: append([]byte(nil), reply...), Established: established}, nil
 }
 
@@ -306,6 +344,65 @@ func (c *ControlPlane) handleInformational(sa *controlSA, responderCookie Cookie
 	}
 	reply, err := sa.main.EncodeInformational(messageID, replyPayloads)
 	return reply, events, err
+}
+
+// PollDPD creates proactive RFC 3706 probes and retires peers that miss three
+// consecutive intervals. Any authenticated IKE traffic clears the probe.
+func (c *ControlPlane) PollDPD(now time.Time) []ControlDatagram {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.config.DPDInterval <= 0 {
+		return nil
+	}
+	var datagrams []ControlDatagram
+	for cookie, sa := range c.sas {
+		if sa.main.State() != MainModeEstablished || !sa.main.Capabilities().DPD || sa.peerAddr == nil {
+			continue
+		}
+		if sa.nextDPD.IsZero() {
+			sa.nextDPD = now.Add(c.config.DPDInterval)
+			continue
+		}
+		if now.Before(sa.nextDPD) {
+			continue
+		}
+		if sa.dpdOutstanding {
+			sa.dpdFailures++
+			if sa.dpdFailures >= 3 {
+				c.debug("ipsec lifecycle DPD timeout peer=%s responder_cookie=%x", sa.peerAddr, cookie)
+				sa.main.Close()
+				delete(c.sas, cookie)
+				c.pending = append(c.pending, LifecycleEvent{Type: LifecycleExpireIKE, ResponderCookie: cookie})
+				continue
+			}
+		} else {
+			sa.dpdSequence++
+			if sa.dpdSequence == 0 {
+				sa.dpdSequence = 1
+			}
+		}
+		data := uint32Bytes(sa.dpdSequence)
+		payload := Notification{DOI: DOIIPsec, ProtocolID: ProtocolIKE, SPI: ikeDeleteSPI(sa.main.initiatorCookie, sa.main.responderCookie), MessageType: NotifyRThere, Data: data}
+		messageID, err := c.newMessageID(0)
+		if err != nil {
+			continue
+		}
+		wire, err := sa.main.EncodeInformational(messageID, []Payload{payload})
+		if err != nil {
+			continue
+		}
+		datagrams = append(datagrams, ControlDatagram{Peer: cloneNetAddr(sa.peerAddr), Payload: wire, NATT: sa.natt})
+		c.debug("ipsec lifecycle DPD tx peer=%s responder_cookie=%x sequence=%d retry=%d natt=%t", sa.peerAddr, cookie, sa.dpdSequence, sa.dpdFailures, sa.natt)
+		sa.dpdOutstanding = true
+		sa.nextDPD = now.Add(c.config.DPDInterval)
+	}
+	return datagrams
+}
+
+func (c *ControlPlane) debug(format string, args ...any) {
+	if c.config.Debugf != nil {
+		c.config.Debugf(format, args...)
+	}
 }
 
 func (c *ControlPlane) newMessageID(exclude uint32) (uint32, error) {

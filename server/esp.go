@@ -159,6 +159,7 @@ type ESPBridge struct {
 	Registry *ESPRegistry
 	mu       sync.RWMutex
 	flows    map[string]espFlow
+	Debugf   func(string, ...any)
 }
 
 func NewESPBridge(engine *Engine, registry *ESPRegistry) (*ESPBridge, error) {
@@ -190,6 +191,9 @@ func (b *ESPBridge) Handle(peer net.Addr, wire []byte, now time.Time) (ESPBridge
 		return ESPBridgeResult{}, ErrNotL2TP
 	}
 	logicalPeer := &net.UDPAddr{IP: append(net.IP(nil), session.peerIP...), Port: int(sourcePort)}
+	if b.Debugf != nil {
+		b.Debugf("esp open peer=%s spi=%08x next_header=%d udp=%d->%d payload_bytes=%d encapsulation=%d", peer, session.inboundSPI, next, sourcePort, destinationPort, len(payload), session.encapsulation)
+	}
 	result, err := b.Engine.HandleDatagram(logicalPeer, payload, now)
 	if err != nil {
 		return ESPBridgeResult{}, err
