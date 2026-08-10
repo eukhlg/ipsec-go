@@ -78,3 +78,31 @@ func TestESPRegistryRejectsPeerAndMarksNATT(t *testing.T) {
 		t.Fatalf("error=%v", err)
 	}
 }
+
+func TestESPRegistryRekeyOverlapAndLifecycleRemoval(t *testing.T) {
+	peer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 4500}
+	cookie := isakmp.Cookie{9}
+	first := testESPPair(isakmp.EncapsulationNATTTransport)
+	first.ResponderCookie = cookie
+	second := testESPPair(isakmp.EncapsulationNATTTransport)
+	second.ResponderCookie = cookie
+	second.Inbound.SPI, second.Outbound.SPI = 0x33333333, 0x44444444
+	registry := NewESPRegistry()
+	if err := registry.Install(peer, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Install(peer, second); err != nil {
+		t.Fatal(err)
+	}
+	if registry.Count() != 2 {
+		t.Fatalf("overlapping SAs=%d", registry.Count())
+	}
+	registry.Remove(first.Outbound.SPI)
+	if registry.Count() != 1 {
+		t.Fatalf("paired removal left %d SAs", registry.Count())
+	}
+	registry.RemoveIKE(cookie)
+	if registry.Count() != 0 {
+		t.Fatalf("IKE removal left %d SAs", registry.Count())
+	}
+}

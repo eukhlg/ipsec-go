@@ -36,6 +36,10 @@ func TestControlPlaneCreatesReplaysAndExpiresSA(t *testing.T) {
 	if control.SACount() != 1 {
 		t.Fatalf("SAs=%d", control.SACount())
 	}
+	events := control.Maintain(now.Add(2 * time.Minute))
+	if len(events) != 1 || events[0].Type != LifecycleExpireIKE {
+		t.Fatalf("expiry events=%#v", events)
+	}
 }
 
 func TestControlPlaneHonorsNegotiatedPhase1Lifetime(t *testing.T) {

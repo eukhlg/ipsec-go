@@ -184,3 +184,20 @@ func TestMainModeEchoesMicrosoftL2TPVendorCapability(t *testing.T) {
 		t.Fatalf("payloads=%#v caps=%#v", packet.Payloads, responder.Capabilities())
 	}
 }
+
+func TestMainModeEchoesDPDCapability(t *testing.T) {
+	sa := SecurityAssociation{DOI: DOIIPsec, Situation: SituationIdentityOnly, Proposals: []Proposal{{Number: 1, ProtocolID: ProtocolIKE, Transforms: []Transform{phase1Transform(EncryptionAESCBC, HashSHA1, DHGroup2, 128)}}}}
+	responder, err := NewMainModeResponder(MainModeConfig{PreSharedKey: []byte("psk"), ResponderID: Identification{IDType: IDIPv4Address, Data: []byte{192, 0, 2, 1}}, Random: bytes.NewReader(bytes.Repeat([]byte{3}, 256))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _ := (Packet{InitiatorCookie: Cookie{1}, Exchange: ExchangeIdentityProtect, Payloads: []Payload{sa, DataPayload{Kind: PayloadVendorID, Data: VendorDPDRFC3706}}}).MarshalBinary()
+	reply, err := responder.Handle(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, _ := DecodePacket(reply)
+	if len(packet.Payloads) != 2 || !bytes.Equal(packet.Payloads[1].(DataPayload).Data, VendorDPDRFC3706) || !responder.Capabilities().DPD {
+		t.Fatalf("payloads=%#v capabilities=%#v", packet.Payloads, responder.Capabilities())
+	}
+}

@@ -149,6 +149,9 @@ func (r *MainModeResponder) handleSA(packet Packet, wire []byte) ([]byte, error)
 	if r.capabilities.NATTRFC3947 {
 		replyPayloads = append(replyPayloads, DataPayload{Kind: PayloadVendorID, Data: VendorNATTRFC3947})
 	}
+	if r.capabilities.DPD {
+		replyPayloads = append(replyPayloads, DataPayload{Kind: PayloadVendorID, Data: VendorDPDRFC3706})
+	}
 	return (Packet{InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, Exchange: ExchangeIdentityProtect, Payloads: replyPayloads}).MarshalBinary()
 }
 

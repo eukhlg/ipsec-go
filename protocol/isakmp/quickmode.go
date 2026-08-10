@@ -31,8 +31,9 @@ type ESPDirectionalKeys struct {
 	EncryptionKey, AuthenticationKey []byte
 }
 type ESPPair struct {
-	Transform         ESPTransform
-	Inbound, Outbound ESPDirectionalKeys
+	Transform                        ESPTransform
+	InitiatorCookie, ResponderCookie Cookie
+	Inbound, Outbound                ESPDirectionalKeys
 }
 
 type QuickModeResponder struct {
@@ -159,7 +160,7 @@ func (q *QuickModeResponder) handleProposal(packet Packet) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	q.pair = ESPPair{Transform: espTransform,
+	q.pair = ESPPair{Transform: espTransform, InitiatorCookie: q.config.InitiatorCookie, ResponderCookie: q.config.ResponderCookie,
 		Inbound:  ESPDirectionalKeys{SPI: inboundSPI, EncryptionKey: append([]byte(nil), inKeymat[:espTransform.KeyBits/8]...), AuthenticationKey: append([]byte(nil), inKeymat[espTransform.KeyBits/8:]...)},
 		Outbound: ESPDirectionalKeys{SPI: outboundSPI, EncryptionKey: append([]byte(nil), outKeymat[:espTransform.KeyBits/8]...), AuthenticationKey: append([]byte(nil), outKeymat[espTransform.KeyBits/8:]...)},
 	}

@@ -26,6 +26,13 @@ const (
 )
 
 const (
+	NotifyResponderLifetime uint16 = 24576
+	NotifyInitialContact    uint16 = 24578
+	NotifyRThere            uint16 = 36136
+	NotifyRThereACK         uint16 = 36137
+)
+
+const (
 	LifeTypeSeconds   uint16 = 1
 	LifeTypeKilobytes uint16 = 2
 )

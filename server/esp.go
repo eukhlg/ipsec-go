@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"l2tp-go/protocol/esp"
@@ -19,17 +20,24 @@ var (
 )
 
 type espSession struct {
-	peerIP            net.IP
-	inbound, outbound *esp.SA
-	encapsulation     uint16
+	peerIP                  net.IP
+	inbound, outbound       *esp.SA
+	encapsulation           uint16
+	inboundSPI, outboundSPI uint32
+	ikeCookie               isakmp.Cookie
+	revoked                 atomic.Bool
 }
 
 type ESPRegistry struct {
 	mu      sync.RWMutex
 	inbound map[uint32]*espSession
+	bySPI   map[uint32]*espSession
+	byIKE   map[isakmp.Cookie]map[*espSession]struct{}
 }
 
-func NewESPRegistry() *ESPRegistry { return &ESPRegistry{inbound: make(map[uint32]*espSession)} }
+func NewESPRegistry() *ESPRegistry {
+	return &ESPRegistry{inbound: make(map[uint32]*espSession), bySPI: make(map[uint32]*espSession), byIKE: make(map[isakmp.Cookie]map[*espSession]struct{})}
+}
 
 func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
 	ip := addressIP(peer)
@@ -51,7 +59,21 @@ func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.inbound[pair.Inbound.SPI] = &espSession{peerIP: append(net.IP(nil), ip...), inbound: inbound, outbound: outbound, encapsulation: pair.Transform.Encapsulation}
+	session := &espSession{peerIP: append(net.IP(nil), ip...), inbound: inbound, outbound: outbound, encapsulation: pair.Transform.Encapsulation, inboundSPI: pair.Inbound.SPI, outboundSPI: pair.Outbound.SPI, ikeCookie: pair.ResponderCookie}
+	if old := r.bySPI[pair.Inbound.SPI]; old != nil {
+		r.removeLocked(old)
+	}
+	if old := r.bySPI[pair.Outbound.SPI]; old != nil {
+		r.removeLocked(old)
+	}
+	r.inbound[pair.Inbound.SPI] = session
+	r.bySPI[pair.Inbound.SPI], r.bySPI[pair.Outbound.SPI] = session, session
+	if pair.ResponderCookie != (isakmp.Cookie{}) {
+		if r.byIKE[pair.ResponderCookie] == nil {
+			r.byIKE[pair.ResponderCookie] = make(map[*espSession]struct{})
+		}
+		r.byIKE[pair.ResponderCookie][session] = struct{}{}
+	}
 	return nil
 }
 
@@ -66,14 +88,56 @@ func (r *ESPRegistry) lookup(peer net.Addr, wire []byte) (*espSession, error) {
 	if session == nil {
 		return nil, ErrUnknownESP
 	}
+	if session.revoked.Load() {
+		return nil, ErrUnknownESP
+	}
 	if ip := addressIP(peer); ip == nil || !ip.Equal(session.peerIP) {
 		return nil, ErrESPPeer
 	}
 	return session, nil
 }
 
-func (r *ESPRegistry) Remove(spi uint32) { r.mu.Lock(); delete(r.inbound, spi); r.mu.Unlock() }
-func (r *ESPRegistry) Count() int        { r.mu.RLock(); defer r.mu.RUnlock(); return len(r.inbound) }
+func (r *ESPRegistry) Remove(spi uint32) {
+	r.mu.Lock()
+	if session := r.bySPI[spi]; session != nil {
+		r.removeLocked(session)
+	}
+	r.mu.Unlock()
+}
+
+func (r *ESPRegistry) RemoveIKE(cookie isakmp.Cookie) {
+	r.mu.Lock()
+	for session := range r.byIKE[cookie] {
+		r.removeLocked(session)
+	}
+	delete(r.byIKE, cookie)
+	r.mu.Unlock()
+}
+
+func (r *ESPRegistry) Close() {
+	r.mu.Lock()
+	for _, session := range r.inbound {
+		session.revoked.Store(true)
+	}
+	r.inbound = make(map[uint32]*espSession)
+	r.bySPI = make(map[uint32]*espSession)
+	r.byIKE = make(map[isakmp.Cookie]map[*espSession]struct{})
+	r.mu.Unlock()
+}
+
+func (r *ESPRegistry) removeLocked(session *espSession) {
+	session.revoked.Store(true)
+	delete(r.inbound, session.inboundSPI)
+	delete(r.bySPI, session.inboundSPI)
+	delete(r.bySPI, session.outboundSPI)
+	if sessions := r.byIKE[session.ikeCookie]; sessions != nil {
+		delete(sessions, session)
+		if len(sessions) == 0 {
+			delete(r.byIKE, session.ikeCookie)
+		}
+	}
+}
+func (r *ESPRegistry) Count() int { r.mu.RLock(); defer r.mu.RUnlock(); return len(r.inbound) }
 
 type ESPDatagram struct {
 	Payload []byte
@@ -113,6 +177,9 @@ func (b *ESPBridge) Handle(peer net.Addr, wire []byte, now time.Time) (ESPBridge
 	}
 	udp, next, err := session.inbound.Open(wire)
 	if err != nil {
+		if errors.Is(err, esp.ErrSALifetime) {
+			b.Registry.Remove(session.inboundSPI)
+		}
 		return ESPBridgeResult{}, err
 	}
 	if next != esp.IPProtocolUDP {
@@ -134,6 +201,9 @@ func (b *ESPBridge) Handle(peer net.Addr, wire []byte, now time.Time) (ESPBridge
 	for _, reply := range result.Replies {
 		datagram, err := sealUDPReply(session, peer, sourcePort, reply)
 		if err != nil {
+			if errors.Is(err, esp.ErrSALifetime) {
+				b.Registry.Remove(session.inboundSPI)
+			}
 			return ESPBridgeResult{}, err
 		}
 		out.Datagrams = append(out.Datagrams, datagram)
@@ -150,10 +220,17 @@ func (b *ESPBridge) SealL2TP(peer net.Addr, payload []byte) (ESPDatagram, error)
 	if !ok {
 		return ESPDatagram{}, ErrESPPeer
 	}
-	return sealUDPReply(flow.session, flow.peer, flow.clientPort, payload)
+	datagram, err := sealUDPReply(flow.session, flow.peer, flow.clientPort, payload)
+	if errors.Is(err, esp.ErrSALifetime) {
+		b.Registry.Remove(flow.session.inboundSPI)
+	}
+	return datagram, err
 }
 
 func sealUDPReply(session *espSession, peer net.Addr, clientPort uint16, payload []byte) (ESPDatagram, error) {
+	if session.revoked.Load() {
+		return ESPDatagram{}, ErrUnknownESP
+	}
 	udp := encodeUDP(1701, clientPort, payload)
 	wire, err := session.outbound.Seal(udp, esp.IPProtocolUDP)
 	if err != nil {

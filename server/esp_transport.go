@@ -19,6 +19,7 @@ type ESPTransportServer struct {
 	NATT         bool
 	HandleResult ESPResultHandler
 	Established  IKEEstablishedHandler
+	Lifecycle    IKELifecycleHandler
 }
 
 func ListenRawESP(address string, bridge *ESPBridge) (*ESPTransportServer, error) {
@@ -58,6 +59,11 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 			}
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
+				if s.ControlPlane != nil && s.Lifecycle != nil {
+					if events := s.ControlPlane.Maintain(time.Now()); len(events) != 0 {
+						s.Lifecycle(ctx, events)
+					}
+				}
 				continue
 			}
 			return err
@@ -74,6 +80,11 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 				}
 				result, err := s.ControlPlane.HandleNATTDatagram(peer, payload, time.Now())
 				if err != nil {
+					if s.Lifecycle != nil {
+						if events := s.ControlPlane.Maintain(time.Now()); len(events) != 0 {
+							s.Lifecycle(ctx, events)
+						}
+					}
 					continue
 				}
 				if len(result.Reply) != 0 {
@@ -83,6 +94,14 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 				}
 				if result.Established != nil && s.Established != nil {
 					s.Established(ctx, peer, *result.Established)
+				}
+				if len(result.Lifecycle) != 0 && s.Lifecycle != nil {
+					s.Lifecycle(ctx, result.Lifecycle)
+				}
+				if s.Lifecycle != nil {
+					if events := s.ControlPlane.Maintain(time.Now()); len(events) != 0 {
+						s.Lifecycle(ctx, events)
+					}
 				}
 				continue
 			case esp.NATTESP:
