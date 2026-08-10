@@ -72,7 +72,7 @@ func TestPhase2IV(t *testing.T) {
 	}
 }
 
-func TestEncryptedPayloadDecodeAllowsOnlyZeroPadding(t *testing.T) {
+func TestEncryptedPayloadDecodeAllowsArbitraryPadding(t *testing.T) {
 	first, wire, err := MarshalPayloads([]Payload{DataPayload{Kind: PayloadNonce, Data: []byte{1, 2, 3}}})
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +81,7 @@ func TestEncryptedPayloadDecodeAllowsOnlyZeroPadding(t *testing.T) {
 	if err != nil || len(payloads) != 1 {
 		t.Fatalf("payloads=%#v err=%v", payloads, err)
 	}
-	if _, err := DecodePayloads(first, append(wire, 1)); err == nil {
-		t.Fatal("accepted nonzero padding")
+	if payloads, err := DecodePayloads(first, append(wire, 0xa5, 0x01)); err != nil || len(payloads) != 1 {
+		t.Fatalf("arbitrary padding rejected: payloads=%#v err=%v", payloads, err)
 	}
 }

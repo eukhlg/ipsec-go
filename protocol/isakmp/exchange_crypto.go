@@ -2,7 +2,6 @@ package isakmp
 
 import (
 	"encoding/binary"
-	"fmt"
 )
 
 // MarshalPayloads exposes the exact payload bytes used by IKE authentication
@@ -11,8 +10,8 @@ func MarshalPayloads(payloads []Payload) (PayloadType, []byte, error) {
 	return marshalPayloadChain(payloads)
 }
 
-// DecodePayloads decodes a decrypted payload body. Trailing zero CBC padding
-// is permitted only after a complete payload chain.
+// DecodePayloads decodes a decrypted payload body. Once the payload chain is
+// complete, trailing bytes are CBC padding and may contain any value (RFC 2408).
 func DecodePayloads(first PayloadType, plaintext []byte) ([]Payload, error) {
 	payloads := make([]Payload, 0, 4)
 	current := first
@@ -35,11 +34,6 @@ func DecodePayloads(first PayloadType, plaintext []byte) ([]Payload, error) {
 		}
 		payloads = append(payloads, payload)
 		wire, current = wire[size:], next
-	}
-	for _, b := range wire {
-		if b != 0 {
-			return nil, fmt.Errorf("%w: nonzero encrypted padding", ErrInvalidPayload)
-		}
 	}
 	return payloads, nil
 }

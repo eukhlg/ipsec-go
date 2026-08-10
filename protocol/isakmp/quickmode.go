@@ -116,15 +116,18 @@ func (q *QuickModeResponder) handle(wire []byte) ([]byte, error) {
 func (q *QuickModeResponder) handleProposal(packet Packet) ([]byte, error) {
 	plaintext, err := q.cipher.Decrypt(packet.EncryptedPayload)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("quick mode decrypt proposal: %w", err)
 	}
 	payloads, meaningful, err := decodePayloadsWithLength(packet.FirstPayload, plaintext)
-	if err != nil || len(payloads) < 3 {
-		return nil, ErrUnexpectedExchange
+	if err != nil {
+		return nil, fmt.Errorf("quick mode decode proposal: %w", err)
+	}
+	if len(payloads) < 3 {
+		return nil, fmt.Errorf("%w: quick mode proposal has %d payloads", ErrUnexpectedExchange, len(payloads))
 	}
 	hashPayload, ok := payloads[0].(DataPayload)
 	if !ok || hashPayload.Kind != PayloadHash {
-		return nil, ErrUnexpectedExchange
+		return nil, fmt.Errorf("%w: quick mode first payload is not HASH", ErrUnexpectedExchange)
 	}
 	hashPayloadLength := int(binary.BigEndian.Uint16(plaintext[2:4]))
 	if !VerifyPRF(q.config.Transform.Hash, q.config.Secrets.SKEYIDa, hashPayload.Data, messageIDBytes(q.messageID), plaintext[hashPayloadLength:meaningful]) {
@@ -132,11 +135,11 @@ func (q *QuickModeResponder) handleProposal(packet Packet) ([]byte, error) {
 	}
 	sa, ok := payloads[1].(SecurityAssociation)
 	if !ok {
-		return nil, ErrUnexpectedExchange
+		return nil, fmt.Errorf("%w: quick mode second payload is not SA", ErrUnexpectedExchange)
 	}
 	nonce, ok := payloads[2].(DataPayload)
 	if !ok || nonce.Kind != PayloadNonce || len(nonce.Data) < 16 {
-		return nil, ErrUnexpectedExchange
+		return nil, fmt.Errorf("%w: quick mode third payload is not a valid nonce", ErrUnexpectedExchange)
 	}
 	selectors, err := quickModeSelectors(payloads[3:])
 	if err != nil {
