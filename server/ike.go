@@ -17,6 +17,11 @@ type IKEServer struct {
 	Established  IKEEstablishedHandler
 }
 
+// InstallESPRegistry wires completed Quick Mode pairs into an ESP registry.
+func (s *IKEServer) InstallESPRegistry(registry *ESPRegistry) {
+	s.Established = func(_ context.Context, peer net.Addr, pair isakmp.ESPPair) { _ = registry.Install(peer, pair) }
+}
+
 func ListenIKE(address string, config isakmp.ControlPlaneConfig) (*IKEServer, error) {
 	conn, err := net.ListenPacket("udp", address)
 	if err != nil {

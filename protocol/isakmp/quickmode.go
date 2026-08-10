@@ -189,6 +189,9 @@ func selectESPsa(sa SecurityAssociation, random io.Reader) (SecurityAssociation,
 			if err != nil {
 				continue
 			}
+			if transform.Encapsulation != EncapsulationTransport {
+				continue // NAT-T is enabled only after RFC 3947 port migration.
+			}
 			spiBytes := make([]byte, 4)
 			if _, err := io.ReadFull(random, spiBytes); err != nil {
 				return SecurityAssociation{}, ESPTransform{}, 0, 0, err

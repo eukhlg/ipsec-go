@@ -68,3 +68,15 @@ func TestQuickModeResponderTranscript(t *testing.T) {
 		t.Fatalf("pair=%#v", pair)
 	}
 }
+
+func TestQuickModeDoesNotSelectNATTBeforePortMigration(t *testing.T) {
+	transform := Transform{Number: 1, ID: TransformESPAES, Attributes: []Attribute{
+		TVAttribute(AttributeP2Encapsulation, EncapsulationNATTTransport),
+		TVAttribute(AttributeP2Authentication, ESPAuthHMACSHA196),
+		TVAttribute(AttributeP2KeyLength, 128),
+	}}
+	sa := SecurityAssociation{DOI: DOIIPsec, Situation: SituationIdentityOnly, Proposals: []Proposal{{Number: 1, ProtocolID: ProtocolESP, SPI: []byte{1, 2, 3, 4}, Transforms: []Transform{transform}}}}
+	if _, _, _, _, err := selectESPsa(sa, bytes.NewReader(bytes.Repeat([]byte{1}, 32))); err != ErrUnsupportedTransform {
+		t.Fatalf("error=%v", err)
+	}
+}

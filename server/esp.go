@@ -1,0 +1,193 @@
+package server
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"net"
+	"sync"
+	"time"
+
+	"l2tp-go/protocol/esp"
+	"l2tp-go/protocol/isakmp"
+)
+
+var (
+	ErrUnknownESP = errors.New("esp server: unknown SPI")
+	ErrESPPeer    = errors.New("esp server: peer mismatch")
+	ErrNotL2TP    = errors.New("esp server: transport payload is not UDP/1701")
+)
+
+type espSession struct {
+	peerIP            net.IP
+	inbound, outbound *esp.SA
+	encapsulation     uint16
+}
+
+type ESPRegistry struct {
+	mu      sync.RWMutex
+	inbound map[uint32]*espSession
+}
+
+func NewESPRegistry() *ESPRegistry { return &ESPRegistry{inbound: make(map[uint32]*espSession)} }
+
+func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
+	ip := addressIP(peer)
+	if ip == nil {
+		return ErrESPPeer
+	}
+	inbound, err := esp.NewSA(esp.SAConfig{SPI: pair.Inbound.SPI, Transform: pair.Transform, EncryptionKey: pair.Inbound.EncryptionKey, AuthenticationKey: pair.Inbound.AuthenticationKey})
+	if err != nil {
+		return err
+	}
+	outbound, err := esp.NewSA(esp.SAConfig{SPI: pair.Outbound.SPI, Transform: pair.Transform, EncryptionKey: pair.Outbound.EncryptionKey, AuthenticationKey: pair.Outbound.AuthenticationKey})
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.inbound[pair.Inbound.SPI] = &espSession{peerIP: append(net.IP(nil), ip...), inbound: inbound, outbound: outbound, encapsulation: pair.Transform.Encapsulation}
+	return nil
+}
+
+func (r *ESPRegistry) lookup(peer net.Addr, wire []byte) (*espSession, error) {
+	if len(wire) < 4 {
+		return nil, esp.ErrShortPacket
+	}
+	spi := binary.BigEndian.Uint32(wire[:4])
+	r.mu.RLock()
+	session := r.inbound[spi]
+	r.mu.RUnlock()
+	if session == nil {
+		return nil, ErrUnknownESP
+	}
+	if ip := addressIP(peer); ip == nil || !ip.Equal(session.peerIP) {
+		return nil, ErrESPPeer
+	}
+	return session, nil
+}
+
+func (r *ESPRegistry) Remove(spi uint32) { r.mu.Lock(); delete(r.inbound, spi); r.mu.Unlock() }
+func (r *ESPRegistry) Count() int        { r.mu.RLock(); defer r.mu.RUnlock(); return len(r.inbound) }
+
+type ESPDatagram struct {
+	Payload []byte
+	Peer    net.Addr
+	NATT    bool
+}
+type ESPBridgeResult struct {
+	Datagrams []ESPDatagram
+	L2TP      Result
+}
+type espFlow struct {
+	session    *espSession
+	peer       net.Addr
+	clientPort uint16
+}
+
+type ESPBridge struct {
+	Engine   *Engine
+	Registry *ESPRegistry
+	mu       sync.RWMutex
+	flows    map[string]espFlow
+}
+
+func NewESPBridge(engine *Engine, registry *ESPRegistry) (*ESPBridge, error) {
+	if engine == nil || registry == nil {
+		return nil, errors.New("esp server: engine and registry are required")
+	}
+	return &ESPBridge{Engine: engine, Registry: registry, flows: make(map[string]espFlow)}, nil
+}
+
+// Handle receives a bare ESP packet (raw protocol 50 or the UDP/4500 payload),
+// authenticates it, and feeds its UDP/1701 body to the existing L2TP engine.
+func (b *ESPBridge) Handle(peer net.Addr, wire []byte, now time.Time) (ESPBridgeResult, error) {
+	session, err := b.Registry.lookup(peer, wire)
+	if err != nil {
+		return ESPBridgeResult{}, err
+	}
+	udp, next, err := session.inbound.Open(wire)
+	if err != nil {
+		return ESPBridgeResult{}, err
+	}
+	if next != esp.IPProtocolUDP {
+		return ESPBridgeResult{}, ErrNotL2TP
+	}
+	sourcePort, destinationPort, payload, err := decodeUDP(udp)
+	if err != nil || destinationPort != 1701 {
+		return ESPBridgeResult{}, ErrNotL2TP
+	}
+	logicalPeer := &net.UDPAddr{IP: append(net.IP(nil), session.peerIP...), Port: int(sourcePort)}
+	result, err := b.Engine.HandleDatagram(logicalPeer, payload, now)
+	if err != nil {
+		return ESPBridgeResult{}, err
+	}
+	b.mu.Lock()
+	b.flows[logicalPeer.String()] = espFlow{session: session, peer: peer, clientPort: sourcePort}
+	b.mu.Unlock()
+	out := ESPBridgeResult{L2TP: result}
+	for _, reply := range result.Replies {
+		datagram, err := sealUDPReply(session, peer, sourcePort, reply)
+		if err != nil {
+			return ESPBridgeResult{}, err
+		}
+		out.Datagrams = append(out.Datagrams, datagram)
+	}
+	return out, nil
+}
+
+// SealL2TP encrypts an asynchronous L2TP payload, such as a packet returned
+// from TUN routing, for a previously observed protected UDP flow.
+func (b *ESPBridge) SealL2TP(peer net.Addr, payload []byte) (ESPDatagram, error) {
+	b.mu.RLock()
+	flow, ok := b.flows[peer.String()]
+	b.mu.RUnlock()
+	if !ok {
+		return ESPDatagram{}, ErrESPPeer
+	}
+	return sealUDPReply(flow.session, flow.peer, flow.clientPort, payload)
+}
+
+func sealUDPReply(session *espSession, peer net.Addr, clientPort uint16, payload []byte) (ESPDatagram, error) {
+	udp := encodeUDP(1701, clientPort, payload)
+	wire, err := session.outbound.Seal(udp, esp.IPProtocolUDP)
+	if err != nil {
+		return ESPDatagram{}, err
+	}
+	return ESPDatagram{Payload: wire, Peer: peer, NATT: session.encapsulation == isakmp.EncapsulationNATTTransport}, nil
+}
+
+func decodeUDP(wire []byte) (uint16, uint16, []byte, error) {
+	if len(wire) < 8 {
+		return 0, 0, nil, ErrNotL2TP
+	}
+	length := int(binary.BigEndian.Uint16(wire[4:6]))
+	if length < 8 || length > len(wire) {
+		return 0, 0, nil, ErrNotL2TP
+	}
+	return binary.BigEndian.Uint16(wire[:2]), binary.BigEndian.Uint16(wire[2:4]), append([]byte(nil), wire[8:length]...), nil
+}
+func encodeUDP(source, destination uint16, payload []byte) []byte {
+	wire := make([]byte, 8+len(payload))
+	binary.BigEndian.PutUint16(wire[:2], source)
+	binary.BigEndian.PutUint16(wire[2:4], destination)
+	binary.BigEndian.PutUint16(wire[4:6], uint16(len(wire)))
+	copy(wire[8:], payload)
+	return wire
+}
+
+func addressIP(peer net.Addr) net.IP {
+	switch value := peer.(type) {
+	case *net.UDPAddr:
+		return value.IP
+	case *net.IPAddr:
+		return value.IP
+	}
+	host, _, err := net.SplitHostPort(peer.String())
+	if err != nil {
+		return nil
+	}
+	return net.ParseIP(host)
+}
+
+func (r *ESPRegistry) String() string { return fmt.Sprintf("ESPRegistry{%d}", r.Count()) }
