@@ -44,6 +44,8 @@ func DecodePayloads(first PayloadType, plaintext []byte) ([]Payload, error) {
 	return payloads, nil
 }
 
+// MainModeHash calculates HASH_I or HASH_R. initiatorSA and identityBody must
+// contain payload bodies only; ISAKMP generic payload headers are not included.
 func MainModeHash(transform Phase1Transform, skeyid, initiatorPublic, responderPublic []byte, initiatorCookie, responderCookie Cookie, initiatorSA, identityBody []byte, initiator bool) ([]byte, error) {
 	if initiator {
 		return PRF(transform.Hash, skeyid, initiatorPublic, responderPublic, initiatorCookie[:], responderCookie[:], initiatorSA, identityBody)

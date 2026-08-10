@@ -135,7 +135,9 @@ func (r *MainModeResponder) handleSA(packet Packet, wire []byte) ([]byte, error)
 	if saLength < 4 || headerSize+saLength > len(wire) {
 		return nil, ErrInvalidPayload
 	}
-	r.initiatorSA = append([]byte(nil), wire[headerSize:headerSize+saLength]...)
+	// RFC 2409 defines SAI_b as the body of the initiator's SA payload,
+	// excluding its four-byte generic payload header.
+	r.initiatorSA = append([]byte(nil), wire[headerSize+4:headerSize+saLength]...)
 	r.capabilities = DetectPeerCapabilities(packet.Payloads[1:])
 	r.initiatorCookie, r.transform, r.selectedSA = packet.InitiatorCookie, transform, selectedSA
 	if _, err := io.ReadFull(r.config.Random, r.responderCookie[:]); err != nil {

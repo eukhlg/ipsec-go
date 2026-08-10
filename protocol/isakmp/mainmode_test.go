@@ -69,7 +69,7 @@ func TestMainModeResponderTranscript(t *testing.T) {
 	clientCipher, _ := NewCBCContext(suite, secrets.Key, iv)
 	clientID := Identification{IDType: IDIPv4Address, ProtocolID: 17, Port: 500, Data: net.IPv4(198, 51, 100, 7).To4()}
 	saBody, _ := sa.marshalBody()
-	sai := message1[headerSize : headerSize+4+len(saBody)]
+	sai := message1[headerSize+4 : headerSize+4+len(saBody)]
 	idBody, _ := clientID.marshalBody()
 	hashI, _ := MainModeHash(suite, secrets.SKEYID, clientDH.Public(), serverPublic, ci, message2.ResponderCookie, sai, idBody, true)
 	first5, body5, _ := MarshalPayloads([]Payload{clientID, DataPayload{Kind: PayloadHash, Data: hashI}})
