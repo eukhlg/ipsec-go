@@ -21,6 +21,7 @@ type ESPTransportServer struct {
 	Established  IKEEstablishedHandler
 	Lifecycle    IKELifecycleHandler
 	Debugf       func(string, ...any)
+	Tracef       func(string, ...any)
 }
 
 func ListenRawESP(address string, bridge *ESPBridge) (*ESPTransportServer, error) {
@@ -72,7 +73,7 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 		wire := buffer[:n]
 		if s.NATT {
 			kind, payload := esp.ClassifyNATT(wire)
-			s.debug("natt udp/4500 rx peer=%s bytes=%d kind=%d", peer, n, kind)
+			s.trace("natt udp/4500 rx peer=%s bytes=%d kind=%d", peer, n, kind)
 			switch kind {
 			case esp.NATTKeepalive:
 				continue
@@ -141,6 +142,11 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 func (s *ESPTransportServer) debug(format string, args ...any) {
 	if s.Debugf != nil {
 		s.Debugf(format, args...)
+	}
+}
+func (s *ESPTransportServer) trace(format string, args ...any) {
+	if s.Tracef != nil {
+		s.Tracef(format, args...)
 	}
 }
 func (s *ESPTransportServer) Close() error {
