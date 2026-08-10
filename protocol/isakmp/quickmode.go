@@ -250,13 +250,19 @@ func quickModeTail(payloads []Payload) ([]Payload, bool, error) {
 		return nil, false, fmt.Errorf("%w: unsupported Quick Mode tail with %d payloads", ErrUnexpectedExchange, len(payloads))
 	}
 	selectors := make([]Payload, 0, 2)
-	for _, payload := range payloads[:selectorCount] {
+	for index, payload := range payloads[:selectorCount] {
 		selector, ok := payload.(Identification)
 		if !ok {
 			return nil, false, fmt.Errorf("%w: Quick Mode selector is not an ID payload", ErrUnsupportedTransform)
 		}
-		if selector.ProtocolID != 0 && selector.ProtocolID != 17 || selector.Port != 0 && selector.Port != 1701 {
+		if selector.ProtocolID != 0 && selector.ProtocolID != 17 {
 			return nil, false, fmt.Errorf("%w: Quick Mode selector type=%d protocol=%d port=%d bytes=%d", ErrUnsupportedTransform, selector.IDType, selector.ProtocolID, selector.Port, len(selector.Data))
+		}
+		// IDci is the initiator-side selector. macOS binds L2TP to an
+		// ephemeral UDP source port, whereas Windows commonly uses 1701.
+		// IDcr remains restricted to the L2TP server port.
+		if index == 1 && selector.Port != 0 && selector.Port != 1701 {
+			return nil, false, fmt.Errorf("%w: Quick Mode responder selector type=%d protocol=%d port=%d bytes=%d", ErrUnsupportedTransform, selector.IDType, selector.ProtocolID, selector.Port, len(selector.Data))
 		}
 		switch selector.IDType {
 		case IDIPv4Address:

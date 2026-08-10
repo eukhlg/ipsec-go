@@ -159,3 +159,16 @@ func TestQuickModeAcceptsMacOSIPv4RangeSelectors(t *testing.T) {
 		t.Fatal("accepted reversed IPv4 range")
 	}
 }
+
+func TestQuickModeAcceptsMacOSEphemeralClientPort(t *testing.T) {
+	idci := Identification{IDType: IDIPv4Address, ProtocolID: 17, Port: 56284, Data: []byte{192, 0, 2, 10}}
+	idcr := Identification{IDType: IDIPv4Address, ProtocolID: 17, Port: 1701, Data: []byte{203, 0, 113, 1}}
+	selectors, _, err := quickModeTail([]Payload{idci, idcr})
+	if err != nil || len(selectors) != 2 || selectors[0].(Identification).Port != 56284 {
+		t.Fatalf("selectors=%#v err=%v", selectors, err)
+	}
+	idcr.Port = 56284
+	if _, _, err := quickModeTail([]Payload{idci, idcr}); err == nil {
+		t.Fatal("accepted ephemeral responder port")
+	}
+}
