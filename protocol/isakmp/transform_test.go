@@ -24,7 +24,7 @@ func TestParsePhase1Transform(t *testing.T) {
 		wire Transform
 		bits int
 	}{
-		{"aes-default", phase1Transform(EncryptionAESCBC, HashSHA1, DHGroup2, 0), 128},
+		{"aes-128", phase1Transform(EncryptionAESCBC, HashSHA1, DHGroup2, 128), 128},
 		{"aes-256", phase1Transform(EncryptionAESCBC, HashSHA256, DHGroup14, 256), 256},
 		{"3des", phase1Transform(Encryption3DESCBC, HashSHA1, DHGroup2, 0), 192},
 	}
@@ -44,6 +44,7 @@ func TestParsePhase1TransformRejectsUnsafeOrAmbiguousOffers(t *testing.T) {
 		phase1Transform(EncryptionAESCBC, HashMD5, DHGroup2, 128),
 		phase1Transform(EncryptionAESCBC, HashSHA1, DHGroup1, 128),
 		phase1Transform(EncryptionAESCBC, HashSHA1, DHGroup2, 64),
+		phase1Transform(EncryptionAESCBC, HashSHA1, DHGroup2, 0),
 	}
 	duplicate := phase1Transform(EncryptionAESCBC, HashSHA1, DHGroup2, 128)
 	duplicate.Attributes = append(duplicate.Attributes, TVAttribute(AttributeP1Hash, HashSHA1))
@@ -52,6 +53,18 @@ func TestParsePhase1TransformRejectsUnsafeOrAmbiguousOffers(t *testing.T) {
 		if err == nil || (!errors.Is(err, ErrUnsupportedTransform) && !errors.Is(err, ErrInvalidPayload)) {
 			t.Fatalf("expected transform rejection, got %v", err)
 		}
+	}
+}
+
+func TestParsePhase1TransformLifetimePairs(t *testing.T) {
+	transform := phase1Transform(EncryptionAESCBC, HashSHA1, DHGroup2, 128)
+	transform.Attributes = append(transform.Attributes,
+		TVAttribute(AttributeP1LifeType, LifeTypeKilobytes), TLVAttribute(AttributeP1LifeValue, []byte{0, 1, 0, 0}),
+		TVAttribute(AttributeP1LifeType, LifeTypeSeconds), TLVAttribute(AttributeP1LifeValue, []byte{0, 0, 0x70, 0x80}),
+	)
+	suite, err := ParsePhase1Transform(transform)
+	if err != nil || suite.LifetimeSeconds != 28800 {
+		t.Fatalf("suite=%#v err=%v", suite, err)
 	}
 }
 

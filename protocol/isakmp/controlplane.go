@@ -1,7 +1,6 @@
 package isakmp
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -16,11 +15,12 @@ var (
 )
 
 type ControlPlaneConfig struct {
-	PreSharedKey   []byte
-	ResponderID    Identification
-	Random         io.Reader
-	MaxPhase1SAs   int
-	Phase1Lifetime time.Duration
+	PreSharedKey     []byte
+	ResponderID      Identification
+	Random           io.Reader
+	MaxPhase1SAs     int
+	Phase1Lifetime   time.Duration
+	HandshakeTimeout time.Duration
 }
 
 type ControlPlaneResult struct {
@@ -29,11 +29,13 @@ type ControlPlaneResult struct {
 }
 
 type controlSA struct {
-	peer                   string
-	main                   *MainModeResponder
-	quick                  map[uint32]*QuickModeResponder
-	lastRequest, lastReply []byte
-	updated                time.Time
+	peer          string
+	main          *MainModeResponder
+	quick         map[uint32]*QuickModeResponder
+	responses     map[string][]byte
+	responseOrder []string
+	updated       time.Time
+	expires       time.Time
 }
 
 type ControlPlane struct {
@@ -55,6 +57,12 @@ func NewControlPlane(config ControlPlaneConfig) (*ControlPlane, error) {
 	if config.Phase1Lifetime == 0 {
 		config.Phase1Lifetime = 8 * time.Hour
 	}
+	if config.HandshakeTimeout == 0 {
+		config.HandshakeTimeout = 30 * time.Second
+	}
+	if config.HandshakeTimeout < 0 || config.Phase1Lifetime < 0 {
+		return nil, ErrInvalidCryptoInput
+	}
 	return &ControlPlane{config: config, sas: make(map[Cookie]*controlSA)}, nil
 }
 
@@ -72,8 +80,10 @@ func (c *ControlPlane) HandleDatagram(peer net.Addr, wire []byte, now time.Time)
 		}
 		for _, existing := range c.sas {
 			initiatorCookie, _ := existing.main.Cookies()
-			if existing.peer == addressKey(peer) && initiatorCookie == packet.InitiatorCookie && bytes.Equal(existing.lastRequest, wire) {
-				return ControlPlaneResult{Reply: append([]byte(nil), existing.lastReply...)}, nil
+			if existing.peer == addressKey(peer) && initiatorCookie == packet.InitiatorCookie {
+				if reply, ok := existing.responses[string(wire)]; ok {
+					return ControlPlaneResult{Reply: append([]byte(nil), reply...)}, nil
+				}
 			}
 		}
 		if len(c.sas) >= c.config.MaxPhase1SAs {
@@ -91,21 +101,31 @@ func (c *ControlPlane) HandleDatagram(peer net.Addr, wire []byte, now time.Time)
 		if _, collision := c.sas[responderCookie]; collision {
 			return ControlPlaneResult{}, fmt.Errorf("%w: responder cookie collision", ErrInvalidCryptoInput)
 		}
-		c.sas[responderCookie] = &controlSA{peer: addressKey(peer), main: main, quick: make(map[uint32]*QuickModeResponder), lastRequest: append([]byte(nil), wire...), lastReply: append([]byte(nil), reply...), updated: now}
+		lifetime := c.config.Phase1Lifetime
+		if seconds := main.Transform().LifetimeSeconds; seconds != 0 && time.Duration(seconds)*time.Second < lifetime {
+			lifetime = time.Duration(seconds) * time.Second
+		}
+		runtime := &controlSA{peer: addressKey(peer), main: main, quick: make(map[uint32]*QuickModeResponder), responses: make(map[string][]byte), updated: now, expires: now.Add(lifetime)}
+		runtime.cacheResponse(wire, reply)
+		c.sas[responderCookie] = runtime
 		return ControlPlaneResult{Reply: reply}, nil
 	}
 	sa := c.sas[packet.ResponderCookie]
 	if sa == nil || sa.peer != addressKey(peer) {
 		return ControlPlaneResult{}, ErrUnknownSA
 	}
-	if bytes.Equal(sa.lastRequest, wire) {
-		return ControlPlaneResult{Reply: append([]byte(nil), sa.lastReply...)}, nil
+	if reply, ok := sa.responses[string(wire)]; ok {
+		return ControlPlaneResult{Reply: append([]byte(nil), reply...)}, nil
 	}
 	var reply []byte
 	var established *ESPPair
 	switch packet.Exchange {
 	case ExchangeIdentityProtect:
 		reply, err = sa.main.Handle(wire)
+		if err != nil && sa.main.State() == MainModeFailed {
+			sa.main.Close()
+			delete(c.sas, packet.ResponderCookie)
+		}
 	case ExchangeQuickMode:
 		quick := sa.quick[packet.MessageID]
 		if quick == nil {
@@ -129,19 +149,34 @@ func (c *ControlPlane) HandleDatagram(peer net.Addr, wire []byte, now time.Time)
 	if err != nil {
 		return ControlPlaneResult{}, err
 	}
-	sa.lastRequest, sa.lastReply, sa.updated = append(sa.lastRequest[:0], wire...), append(sa.lastReply[:0], reply...), now
+	sa.cacheResponse(wire, reply)
+	sa.updated = now
 	return ControlPlaneResult{Reply: append([]byte(nil), reply...), Established: established}, nil
 }
 
 func (c *ControlPlane) expire(now time.Time) {
 	for cookie, sa := range c.sas {
-		if now.Sub(sa.updated) >= c.config.Phase1Lifetime {
+		handshakeExpired := sa.main.State() != MainModeEstablished && now.Sub(sa.updated) >= c.config.HandshakeTimeout
+		if handshakeExpired || !now.Before(sa.expires) {
+			sa.main.Close()
 			delete(c.sas, cookie)
 		}
 	}
 }
 
 func (c *ControlPlane) SACount() int { c.mu.Lock(); defer c.mu.Unlock(); return len(c.sas) }
+func (sa *controlSA) cacheResponse(request, reply []byte) {
+	key := string(request)
+	if _, exists := sa.responses[key]; !exists {
+		sa.responseOrder = append(sa.responseOrder, key)
+	}
+	sa.responses[key] = append([]byte(nil), reply...)
+	for len(sa.responseOrder) > 8 {
+		old := sa.responseOrder[0]
+		sa.responseOrder = sa.responseOrder[1:]
+		delete(sa.responses, old)
+	}
+}
 func addressKey(peer net.Addr) string {
 	if peer == nil {
 		return ""

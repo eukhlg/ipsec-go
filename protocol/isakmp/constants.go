@@ -25,6 +25,11 @@ const (
 	PayloadNATOADraftAlt  PayloadType = 131
 )
 
+const (
+	LifeTypeSeconds   uint16 = 1
+	LifeTypeKilobytes uint16 = 2
+)
+
 type ExchangeType uint8
 
 const (

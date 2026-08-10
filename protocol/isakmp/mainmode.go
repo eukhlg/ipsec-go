@@ -18,6 +18,7 @@ const (
 	MainModeAwaitKeyExchange
 	MainModeAwaitAuthentication
 	MainModeEstablished
+	MainModeFailed
 )
 
 type MainModeConfig struct {
@@ -39,6 +40,7 @@ type MainModeResponder struct {
 	initiatorNonce, responderNonce   []byte
 	secrets                          Phase1Secrets
 	cipher                           *CBCContext
+	capabilities                     PeerCapabilities
 }
 
 func NewMainModeResponder(config MainModeConfig) (*MainModeResponder, error) {
@@ -57,12 +59,14 @@ func NewMainModeResponder(config MainModeConfig) (*MainModeResponder, error) {
 	if config.ResponderID.IDType == 0 {
 		return nil, fmt.Errorf("%w: responder identity", ErrInvalidCryptoInput)
 	}
+	config.PreSharedKey = append([]byte(nil), config.PreSharedKey...)
 	return &MainModeResponder{config: config}, nil
 }
 
-func (r *MainModeResponder) State() MainModeState       { return r.state }
-func (r *MainModeResponder) Transform() Phase1Transform { return r.transform }
-func (r *MainModeResponder) Cookies() (Cookie, Cookie)  { return r.initiatorCookie, r.responderCookie }
+func (r *MainModeResponder) State() MainModeState           { return r.state }
+func (r *MainModeResponder) Transform() Phase1Transform     { return r.transform }
+func (r *MainModeResponder) Cookies() (Cookie, Cookie)      { return r.initiatorCookie, r.responderCookie }
+func (r *MainModeResponder) Capabilities() PeerCapabilities { return r.capabilities }
 func (r *MainModeResponder) Secrets() (Phase1Secrets, bool) {
 	if r.state != MainModeEstablished {
 		return Phase1Secrets{}, false
@@ -117,6 +121,7 @@ func (r *MainModeResponder) handleSA(packet Packet, wire []byte) ([]byte, error)
 		return nil, ErrInvalidPayload
 	}
 	r.initiatorSA = append([]byte(nil), wire[headerSize:headerSize+saLength]...)
+	r.capabilities = DetectPeerCapabilities(packet.Payloads[1:])
 	r.initiatorCookie, r.transform, r.selectedSA = packet.InitiatorCookie, transform, selectedSA
 	if _, err := io.ReadFull(r.config.Random, r.responderCookie[:]); err != nil {
 		return nil, err
@@ -125,7 +130,11 @@ func (r *MainModeResponder) handleSA(packet Packet, wire []byte) ([]byte, error)
 		r.responderCookie[7] = 1
 	}
 	r.state = MainModeAwaitKeyExchange
-	return (Packet{InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, Exchange: ExchangeIdentityProtect, Payloads: []Payload{selectedSA}}).MarshalBinary()
+	replyPayloads := []Payload{selectedSA}
+	if r.capabilities.MicrosoftL2TP {
+		replyPayloads = append(replyPayloads, DataPayload{Kind: PayloadVendorID, Data: VendorMicrosoftL2TP})
+	}
+	return (Packet{InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, Exchange: ExchangeIdentityProtect, Payloads: replyPayloads}).MarshalBinary()
 }
 
 func (r *MainModeResponder) handleKeyExchange(packet Packet) ([]byte, error) {
@@ -174,24 +183,24 @@ func (r *MainModeResponder) handleAuthentication(packet Packet) ([]byte, error) 
 	}
 	plaintext, err := r.cipher.Decrypt(packet.EncryptedPayload)
 	if err != nil {
-		return nil, err
+		return nil, r.fail(err)
 	}
 	payloads, err := DecodePayloads(packet.FirstPayload, plaintext)
 	if err != nil || len(payloads) != 2 {
-		return nil, ErrUnexpectedExchange
+		return nil, r.fail(ErrUnexpectedExchange)
 	}
 	identity, ok := payloads[0].(Identification)
 	if !ok {
-		return nil, ErrUnexpectedExchange
+		return nil, r.fail(ErrUnexpectedExchange)
 	}
 	hashPayload, ok := payloads[1].(DataPayload)
 	if !ok || hashPayload.Kind != PayloadHash {
-		return nil, ErrUnexpectedExchange
+		return nil, r.fail(ErrUnexpectedExchange)
 	}
 	idBody, _ := identity.marshalBody()
 	expected, err := MainModeHash(r.transform, r.secrets.SKEYID, r.initiatorPublic, r.responderPublic, r.initiatorCookie, r.responderCookie, r.initiatorSA, idBody, true)
 	if err != nil || !VerifyPRFValue(expected, hashPayload.Data) {
-		return nil, fmt.Errorf("%w: HASH_I", ErrInvalidCryptoInput)
+		return nil, r.fail(fmt.Errorf("%w: HASH_I", ErrInvalidCryptoInput))
 	}
 	responderIDBody, _ := r.config.ResponderID.marshalBody()
 	hashR, err := MainModeHash(r.transform, r.secrets.SKEYID, r.initiatorPublic, r.responderPublic, r.initiatorCookie, r.responderCookie, r.initiatorSA, responderIDBody, false)
@@ -204,6 +213,9 @@ func (r *MainModeResponder) handleAuthentication(packet Packet) ([]byte, error) 
 	}
 	ciphertext := r.cipher.Encrypt(body)
 	r.state = MainModeEstablished
+	zeroBytes(r.config.PreSharedKey)
+	r.config.PreSharedKey = nil
+	r.dh = nil
 	return (Packet{InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, Exchange: ExchangeIdentityProtect, Flags: FlagEncrypted, FirstPayload: first, EncryptedPayload: ciphertext}).MarshalBinary()
 }
 
@@ -245,4 +257,30 @@ func VerifyPRFValue(expected, actual []byte) bool {
 }
 func cloneSecrets(s Phase1Secrets) Phase1Secrets {
 	return Phase1Secrets{SKEYID: append([]byte(nil), s.SKEYID...), SKEYIDd: append([]byte(nil), s.SKEYIDd...), SKEYIDa: append([]byte(nil), s.SKEYIDa...), SKEYIDe: append([]byte(nil), s.SKEYIDe...), Key: append([]byte(nil), s.Key...)}
+}
+
+func (r *MainModeResponder) fail(err error) error { r.Close(); r.state = MainModeFailed; return err }
+
+// Close removes authentication and keying material when an SA fails or expires.
+func (r *MainModeResponder) Close() {
+	zeroBytes(r.config.PreSharedKey)
+	r.config.PreSharedKey = nil
+	zeroBytes(r.initiatorNonce)
+	r.initiatorNonce = nil
+	zeroBytes(r.responderNonce)
+	r.responderNonce = nil
+	zeroBytes(r.secrets.SKEYID)
+	zeroBytes(r.secrets.SKEYIDd)
+	zeroBytes(r.secrets.SKEYIDa)
+	zeroBytes(r.secrets.SKEYIDe)
+	zeroBytes(r.secrets.Key)
+	r.secrets = Phase1Secrets{}
+	r.dh = nil
+	r.cipher = nil
+}
+
+func zeroBytes(value []byte) {
+	for i := range value {
+		value[i] = 0
+	}
 }

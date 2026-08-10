@@ -13,11 +13,12 @@ var ErrUnsupportedTransform = errors.New("isakmp: unsupported transform")
 // Phase1Transform is the normalized subset of an IKE phase 1 transform that
 // this implementation can negotiate safely.
 type Phase1Transform struct {
-	Encryption uint16
-	Hash       uint16
-	AuthMethod uint16
-	DHGroup    uint16
-	KeyBits    int
+	Encryption      uint16
+	Hash            uint16
+	AuthMethod      uint16
+	DHGroup         uint16
+	KeyBits         int
+	LifetimeSeconds uint32
 }
 
 type ESPTransform struct {
@@ -84,15 +85,36 @@ func ParsePhase1Transform(t Transform) (Phase1Transform, error) {
 		return Phase1Transform{}, fmt.Errorf("%w: transform id %d", ErrUnsupportedTransform, t.ID)
 	}
 	values := make(map[uint16]uint32)
+	var lifetimeType uint32
 	for _, attribute := range t.Attributes {
-		if _, duplicate := values[attribute.Type]; duplicate {
-			return Phase1Transform{}, fmt.Errorf("%w: duplicate attribute %d", ErrInvalidPayload, attribute.Type)
-		}
 		value, err := attributeUint32(attribute)
 		if err != nil {
 			return Phase1Transform{}, err
 		}
+		if attribute.Type == AttributeP1LifeType {
+			if lifetimeType != 0 {
+				return Phase1Transform{}, fmt.Errorf("%w: consecutive lifetime types", ErrInvalidPayload)
+			}
+			lifetimeType = value
+			continue
+		}
+		if attribute.Type == AttributeP1LifeValue {
+			if lifetimeType == 0 {
+				return Phase1Transform{}, fmt.Errorf("%w: lifetime value without type", ErrInvalidPayload)
+			}
+			if lifetimeType == uint32(LifeTypeSeconds) {
+				values[AttributeP1LifeValue] = value
+			}
+			lifetimeType = 0
+			continue
+		}
+		if _, duplicate := values[attribute.Type]; duplicate {
+			return Phase1Transform{}, fmt.Errorf("%w: duplicate attribute %d", ErrInvalidPayload, attribute.Type)
+		}
 		values[attribute.Type] = value
+	}
+	if lifetimeType != 0 {
+		return Phase1Transform{}, fmt.Errorf("%w: lifetime type without value", ErrInvalidPayload)
 	}
 	for _, required := range []uint16{AttributeP1Encryption, AttributeP1Hash, AttributeP1AuthMethod, AttributeP1DHGroup} {
 		if _, ok := values[required]; !ok {
@@ -107,11 +129,12 @@ func ParsePhase1Transform(t Transform) (Phase1Transform, error) {
 		}
 	}
 	suite := Phase1Transform{
-		Encryption: uint16(values[AttributeP1Encryption]),
-		Hash:       uint16(values[AttributeP1Hash]),
-		AuthMethod: uint16(values[AttributeP1AuthMethod]),
-		DHGroup:    uint16(values[AttributeP1DHGroup]),
-		KeyBits:    int(values[AttributeP1KeyLength]),
+		Encryption:      uint16(values[AttributeP1Encryption]),
+		Hash:            uint16(values[AttributeP1Hash]),
+		AuthMethod:      uint16(values[AttributeP1AuthMethod]),
+		DHGroup:         uint16(values[AttributeP1DHGroup]),
+		KeyBits:         int(values[AttributeP1KeyLength]),
+		LifetimeSeconds: values[AttributeP1LifeValue],
 	}
 	if suite.AuthMethod != AuthPreSharedKey {
 		return Phase1Transform{}, fmt.Errorf("%w: authentication method %d", ErrUnsupportedTransform, suite.AuthMethod)
@@ -126,9 +149,6 @@ func ParsePhase1Transform(t Transform) (Phase1Transform, error) {
 	}
 	switch suite.Encryption {
 	case EncryptionAESCBC:
-		if suite.KeyBits == 0 {
-			suite.KeyBits = 128
-		}
 		if suite.KeyBits != 128 && suite.KeyBits != 192 && suite.KeyBits != 256 {
 			return Phase1Transform{}, fmt.Errorf("%w: AES key length %d", ErrUnsupportedTransform, suite.KeyBits)
 		}

@@ -2,6 +2,7 @@ package isakmp
 
 import (
 	"bytes"
+	"errors"
 	"net"
 	"testing"
 )
@@ -13,11 +14,13 @@ func TestMainModeResponderTranscript(t *testing.T) {
 		t.Fatal(err)
 	}
 	ci := Cookie{1, 2, 3, 4, 5, 6, 7, 8}
+	supported := phase1Transform(EncryptionAESCBC, HashSHA1, DHGroup2, 128)
+	supported.Attributes = append(supported.Attributes, TVAttribute(AttributeP1LifeType, LifeTypeSeconds), TLVAttribute(AttributeP1LifeValue, []byte{0, 0, 0x70, 0x80}))
 	sa := SecurityAssociation{DOI: DOIIPsec, Situation: SituationIdentityOnly, Proposals: []Proposal{{Number: 1, ProtocolID: ProtocolIKE, Transforms: []Transform{
 		phase1Transform(EncryptionDESCBC, HashMD5, DHGroup1, 0),
-		phase1Transform(EncryptionAESCBC, HashSHA1, DHGroup2, 128),
+		supported,
 	}}}}
-	message1, _ := (Packet{InitiatorCookie: ci, Exchange: ExchangeIdentityProtect, Payloads: []Payload{sa}}).MarshalBinary()
+	message1, _ := (Packet{InitiatorCookie: ci, Exchange: ExchangeIdentityProtect, Payloads: []Payload{sa, DataPayload{Kind: PayloadVendorID, Data: VendorMicrosoftL2TP}}}).MarshalBinary()
 	wire2, err := responder.Handle(message1)
 	if err != nil {
 		t.Fatal(err)
@@ -32,6 +35,9 @@ func TestMainModeResponderTranscript(t *testing.T) {
 	selected := message2.Payloads[0].(SecurityAssociation)
 	if len(selected.Proposals[0].Transforms) != 1 || selected.Proposals[0].Transforms[0].Attributes[0].Value != EncryptionAESCBC {
 		t.Fatalf("selected=%#v", selected)
+	}
+	if len(message2.Payloads) != 2 || !responder.Capabilities().MicrosoftL2TP || responder.Transform().LifetimeSeconds != 28800 {
+		t.Fatalf("payloads=%#v caps=%#v transform=%#v", message2.Payloads, responder.Capabilities(), responder.Transform())
 	}
 
 	clientDH, err := NewDHExchange(DHGroup2, bytes.NewReader(bytes.Repeat([]byte{0x24}, 512)))
@@ -61,7 +67,8 @@ func TestMainModeResponderTranscript(t *testing.T) {
 	iv, _ := InitialPhase1IV(suite, clientDH.Public(), serverPublic)
 	clientCipher, _ := NewCBCContext(suite, secrets.Key, iv)
 	clientID := Identification{IDType: IDIPv4Address, ProtocolID: 17, Port: 500, Data: net.IPv4(198, 51, 100, 7).To4()}
-	_, sai, _ := MarshalPayloads([]Payload{sa})
+	saBody, _ := sa.marshalBody()
+	sai := message1[headerSize : headerSize+4+len(saBody)]
 	idBody, _ := clientID.marshalBody()
 	hashI, _ := MainModeHash(suite, secrets.SKEYID, clientDH.Public(), serverPublic, ci, message2.ResponderCookie, sai, idBody, true)
 	first5, body5, _ := MarshalPayloads([]Payload{clientID, DataPayload{Kind: PayloadHash, Data: hashI}})
@@ -96,5 +103,42 @@ func TestMainModeRejectsBadHASHI(t *testing.T) {
 	// Authentication comparison itself is covered without constructing another full transcript.
 	if VerifyPRFValue([]byte{1, 2, 3}, []byte{1, 2, 4}) || VerifyPRFValue([]byte{1}, []byte{1, 0}) {
 		t.Fatal("accepted mismatched hash")
+	}
+}
+
+func TestMainModeFailureClearsSensitiveState(t *testing.T) {
+	psk := []byte("shared secret")
+	responder, err := NewMainModeResponder(MainModeConfig{PreSharedKey: psk, ResponderID: Identification{IDType: IDIPv4Address, Data: []byte{192, 0, 2, 1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	responder.secrets = Phase1Secrets{SKEYID: []byte{1}, SKEYIDd: []byte{2}, SKEYIDa: []byte{3}, SKEYIDe: []byte{4}, Key: []byte{5}}
+	responder.initiatorNonce, responder.responderNonce = []byte{6}, []byte{7}
+	err = responder.fail(ErrInvalidCryptoInput)
+	if !errors.Is(err, ErrInvalidCryptoInput) || responder.State() != MainModeFailed || responder.config.PreSharedKey != nil || responder.secrets.Key != nil || responder.initiatorNonce != nil {
+		t.Fatalf("state=%v responder=%#v", responder.State(), responder)
+	}
+	if string(psk) != "shared secret" {
+		t.Fatal("caller PSK was modified")
+	}
+}
+
+func TestMainModeEchoesMicrosoftL2TPVendorCapability(t *testing.T) {
+	responder, err := NewMainModeResponder(MainModeConfig{PreSharedKey: []byte("psk"), ResponderID: Identification{IDType: IDIPv4Address, Data: []byte{192, 0, 2, 1}}, Random: bytes.NewReader(bytes.Repeat([]byte{8}, 64))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sa := SecurityAssociation{DOI: DOIIPsec, Situation: SituationIdentityOnly, Proposals: []Proposal{{Number: 1, ProtocolID: ProtocolIKE, Transforms: []Transform{phase1Transform(EncryptionAESCBC, HashSHA1, DHGroup2, 128)}}}}
+	request, _ := (Packet{InitiatorCookie: Cookie{1}, Exchange: ExchangeIdentityProtect, Payloads: []Payload{sa, DataPayload{Kind: PayloadVendorID, Data: VendorMicrosoftL2TP}}}).MarshalBinary()
+	reply, err := responder.Handle(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := DecodePacket(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(packet.Payloads) != 2 || !responder.Capabilities().MicrosoftL2TP {
+		t.Fatalf("payloads=%#v caps=%#v", packet.Payloads, responder.Capabilities())
 	}
 }
