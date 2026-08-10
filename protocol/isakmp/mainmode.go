@@ -235,24 +235,30 @@ func (r *MainModeResponder) handleAuthentication(packet Packet) ([]byte, error) 
 	}
 	plaintext, err := r.cipher.Decrypt(packet.EncryptedPayload)
 	if err != nil {
-		return nil, r.fail(err)
+		return nil, r.fail(fmt.Errorf("main mode decrypt authentication: %w", err))
 	}
 	payloads, err := DecodePayloads(packet.FirstPayload, plaintext)
-	if err != nil || len(payloads) != 2 {
-		return nil, r.fail(ErrUnexpectedExchange)
+	if err != nil {
+		return nil, r.fail(fmt.Errorf("main mode decode authentication: %w", err))
+	}
+	if len(payloads) < 2 {
+		return nil, r.fail(fmt.Errorf("%w: main mode authentication has %d payloads", ErrUnexpectedExchange, len(payloads)))
 	}
 	identity, ok := payloads[0].(Identification)
 	if !ok {
-		return nil, r.fail(ErrUnexpectedExchange)
+		return nil, r.fail(fmt.Errorf("%w: main mode first payload is not ID", ErrUnexpectedExchange))
 	}
 	hashPayload, ok := payloads[1].(DataPayload)
 	if !ok || hashPayload.Kind != PayloadHash {
-		return nil, r.fail(ErrUnexpectedExchange)
+		return nil, r.fail(fmt.Errorf("%w: main mode second payload is not HASH", ErrUnexpectedExchange))
 	}
 	idBody, _ := identity.marshalBody()
 	expected, err := MainModeHash(r.transform, r.secrets.SKEYID, r.initiatorPublic, r.responderPublic, r.initiatorCookie, r.responderCookie, r.initiatorSA, idBody, true)
 	if err != nil || !VerifyPRFValue(expected, hashPayload.Data) {
 		return nil, r.fail(fmt.Errorf("%w: HASH_I", ErrInvalidCryptoInput))
+	}
+	if err := validateMainModeAuthenticationTail(payloads[2:], r.initiatorCookie, r.responderCookie); err != nil {
+		return nil, r.fail(err)
 	}
 	responderIDBody, _ := r.config.ResponderID.marshalBody()
 	hashR, err := MainModeHash(r.transform, r.secrets.SKEYID, r.initiatorPublic, r.responderPublic, r.initiatorCookie, r.responderCookie, r.initiatorSA, responderIDBody, false)
@@ -269,6 +275,25 @@ func (r *MainModeResponder) handleAuthentication(packet Packet) ([]byte, error) 
 	r.config.PreSharedKey = nil
 	r.dh = nil
 	return (Packet{InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, Exchange: ExchangeIdentityProtect, Flags: FlagEncrypted, FirstPayload: first, EncryptedPayload: ciphertext}).MarshalBinary()
+}
+
+// macOS includes an authenticated INITIAL-CONTACT notification after HASH_I
+// in Main Mode message 5. It is not part of HASH_I, but is protected by the
+// Phase 1 cipher and therefore safe to process after hash verification.
+func validateMainModeAuthenticationTail(payloads []Payload, initiatorCookie, responderCookie Cookie) error {
+	for _, payload := range payloads {
+		notification, ok := payload.(Notification)
+		if !ok || notification.MessageType != NotifyInitialContact || notification.DOI != DOIIPsec || notification.ProtocolID != ProtocolIKE || len(notification.Data) != 0 {
+			return fmt.Errorf("%w: unsupported Main Mode authentication payload", ErrUnexpectedExchange)
+		}
+		if len(notification.SPI) != 0 {
+			want := append(append([]byte(nil), initiatorCookie[:]...), responderCookie[:]...)
+			if len(notification.SPI) != len(want) || !VerifyPRFValue(want, notification.SPI) {
+				return fmt.Errorf("%w: invalid INITIAL-CONTACT SPI", ErrInvalidPayload)
+			}
+		}
+	}
+	return nil
 }
 
 func selectPhase1SA(sa SecurityAssociation) (SecurityAssociation, Phase1Transform, error) {

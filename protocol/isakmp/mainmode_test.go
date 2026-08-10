@@ -212,3 +212,18 @@ func TestMainModeForceNATTForCapablePeer(t *testing.T) {
 		t.Fatal("force NAT-T selected encapsulation for an incapable peer")
 	}
 }
+
+func TestMainModeAcceptsMacOSInitialContactTail(t *testing.T) {
+	ci, cr := Cookie{1}, Cookie{2}
+	initialContact := Notification{
+		DOI: DOIIPsec, ProtocolID: ProtocolIKE,
+		SPI: append(append([]byte(nil), ci[:]...), cr[:]...), MessageType: NotifyInitialContact,
+	}
+	if err := validateMainModeAuthenticationTail([]Payload{initialContact}, ci, cr); err != nil {
+		t.Fatal(err)
+	}
+	initialContact.MessageType = NotifyResponderLifetime
+	if err := validateMainModeAuthenticationTail([]Payload{initialContact}, ci, cr); err == nil {
+		t.Fatal("accepted unsupported Main Mode notification")
+	}
+}
