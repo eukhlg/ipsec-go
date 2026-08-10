@@ -23,6 +23,7 @@ type QuickModeConfig struct {
 	LastPhase1Block                  []byte
 	Random                           io.Reader
 	NonceSize                        int
+	Encapsulation                    uint16
 }
 
 type ESPDirectionalKeys struct {
@@ -54,6 +55,12 @@ func NewQuickModeResponder(config QuickModeConfig) (*QuickModeResponder, error) 
 		config.NonceSize = 20
 	}
 	if config.NonceSize < 16 || config.NonceSize > 256 {
+		return nil, ErrInvalidCryptoInput
+	}
+	if config.Encapsulation == 0 {
+		config.Encapsulation = EncapsulationTransport
+	}
+	if config.Encapsulation != EncapsulationTransport && config.Encapsulation != EncapsulationNATTTransport {
 		return nil, ErrInvalidCryptoInput
 	}
 	config.Secrets = cloneSecrets(config.Secrets)
@@ -132,7 +139,7 @@ func (q *QuickModeResponder) handleProposal(packet Packet) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	selectedSA, espTransform, outboundSPI, inboundSPI, err := selectESPsa(sa, q.config.Random)
+	selectedSA, espTransform, outboundSPI, inboundSPI, err := selectESPsa(sa, q.config.Encapsulation, q.config.Random)
 	if err != nil {
 		return nil, err
 	}
@@ -253,7 +260,7 @@ func (q *QuickModeResponder) Close() {
 	q.state = QuickModeFailed
 }
 
-func selectESPsa(sa SecurityAssociation, random io.Reader) (SecurityAssociation, ESPTransform, uint32, uint32, error) {
+func selectESPsa(sa SecurityAssociation, encapsulation uint16, random io.Reader) (SecurityAssociation, ESPTransform, uint32, uint32, error) {
 	if sa.DOI != DOIIPsec || sa.Situation != SituationIdentityOnly {
 		return SecurityAssociation{}, ESPTransform{}, 0, 0, ErrUnsupportedTransform
 	}
@@ -266,8 +273,8 @@ func selectESPsa(sa SecurityAssociation, random io.Reader) (SecurityAssociation,
 			if err != nil {
 				continue
 			}
-			if transform.Encapsulation != EncapsulationTransport {
-				continue // NAT-T is enabled only after RFC 3947 port migration.
+			if transform.Encapsulation != encapsulation {
+				continue
 			}
 			spiBytes := make([]byte, 4)
 			if _, err := io.ReadFull(random, spiBytes); err != nil {

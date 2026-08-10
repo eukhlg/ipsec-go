@@ -23,13 +23,21 @@ func (s *IKEServer) InstallESPRegistry(registry *ESPRegistry) {
 }
 
 func ListenIKE(address string, config isakmp.ControlPlaneConfig) (*IKEServer, error) {
-	conn, err := net.ListenPacket("udp", address)
+	control, err := isakmp.NewControlPlane(config)
 	if err != nil {
 		return nil, err
 	}
-	control, err := isakmp.NewControlPlane(config)
+	return ListenIKEWithControl(address, control)
+}
+
+// ListenIKEWithControl binds an IKE socket to an existing control plane. It is
+// used by UDP/500 and the shared UDP/4500 NAT-T demultiplexer.
+func ListenIKEWithControl(address string, control *isakmp.ControlPlane) (*IKEServer, error) {
+	if control == nil {
+		return nil, errors.New("ike server: missing control plane")
+	}
+	conn, err := net.ListenPacket("udp", address)
 	if err != nil {
-		_ = conn.Close()
 		return nil, err
 	}
 	return &IKEServer{Conn: conn, ControlPlane: control}, nil

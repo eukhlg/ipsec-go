@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 )
@@ -15,13 +16,14 @@ var (
 )
 
 type ControlPlaneConfig struct {
-	PreSharedKey     []byte
-	ResponderID      Identification
-	Random           io.Reader
-	MaxPhase1SAs     int
-	Phase1Lifetime   time.Duration
-	HandshakeTimeout time.Duration
-	QuickModeTimeout time.Duration
+	PreSharedKey      []byte
+	ResponderID       Identification
+	ResponderEndpoint netip.AddrPort
+	Random            io.Reader
+	MaxPhase1SAs      int
+	Phase1Lifetime    time.Duration
+	HandshakeTimeout  time.Duration
+	QuickModeTimeout  time.Duration
 }
 
 type ControlPlaneResult struct {
@@ -31,6 +33,7 @@ type ControlPlaneResult struct {
 
 type controlSA struct {
 	peer          string
+	peerIP        netip.Addr
 	main          *MainModeResponder
 	quick         map[uint32]*QuickModeResponder
 	quickUpdated  map[uint32]time.Time
@@ -48,6 +51,9 @@ type ControlPlane struct {
 
 func NewControlPlane(config ControlPlaneConfig) (*ControlPlane, error) {
 	if len(config.PreSharedKey) == 0 || config.ResponderID.IDType == 0 {
+		return nil, ErrInvalidCryptoInput
+	}
+	if config.ResponderEndpoint.IsValid() && !config.ResponderEndpoint.Addr().Is4() {
 		return nil, ErrInvalidCryptoInput
 	}
 	if config.MaxPhase1SAs == 0 {
@@ -72,6 +78,16 @@ func NewControlPlane(config ControlPlaneConfig) (*ControlPlane, error) {
 }
 
 func (c *ControlPlane) HandleDatagram(peer net.Addr, wire []byte, now time.Time) (ControlPlaneResult, error) {
+	return c.handleDatagram(peer, wire, now, false)
+}
+
+// HandleNATTDatagram processes marker-prefixed IKE received on the local
+// UDP/4500 socket. A NAT may map the peer's source port to any value.
+func (c *ControlPlane) HandleNATTDatagram(peer net.Addr, wire []byte, now time.Time) (ControlPlaneResult, error) {
+	return c.handleDatagram(peer, wire, now, true)
+}
+
+func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time, viaNATT bool) (ControlPlaneResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	packet, err := DecodePacket(wire)
@@ -94,7 +110,11 @@ func (c *ControlPlane) HandleDatagram(peer net.Addr, wire []byte, now time.Time)
 		if len(c.sas) >= c.config.MaxPhase1SAs {
 			return ControlPlaneResult{}, ErrSALimit
 		}
-		main, err := NewMainModeResponder(MainModeConfig{PreSharedKey: c.config.PreSharedKey, ResponderID: c.config.ResponderID, Random: c.config.Random})
+		remoteEndpoint, ok := addressPort(peer)
+		if c.config.ResponderEndpoint.IsValid() && !ok {
+			return ControlPlaneResult{}, ErrUnknownSA
+		}
+		main, err := NewMainModeResponder(MainModeConfig{PreSharedKey: c.config.PreSharedKey, ResponderID: c.config.ResponderID, LocalEndpoint: c.config.ResponderEndpoint, RemoteEndpoint: remoteEndpoint, Random: c.config.Random})
 		if err != nil {
 			return ControlPlaneResult{}, err
 		}
@@ -110,16 +130,27 @@ func (c *ControlPlane) HandleDatagram(peer net.Addr, wire []byte, now time.Time)
 		if seconds := main.Transform().LifetimeSeconds; seconds != 0 && time.Duration(seconds)*time.Second < lifetime {
 			lifetime = time.Duration(seconds) * time.Second
 		}
-		runtime := &controlSA{peer: addressKey(peer), main: main, quick: make(map[uint32]*QuickModeResponder), quickUpdated: make(map[uint32]time.Time), responses: make(map[string][]byte), updated: now, expires: now.Add(lifetime)}
+		runtime := &controlSA{peer: addressKey(peer), peerIP: remoteEndpoint.Addr(), main: main, quick: make(map[uint32]*QuickModeResponder), quickUpdated: make(map[uint32]time.Time), responses: make(map[string][]byte), updated: now, expires: now.Add(lifetime)}
 		runtime.cacheResponse(wire, reply)
 		c.sas[responderCookie] = runtime
 		return ControlPlaneResult{Reply: reply}, nil
 	}
 	sa := c.sas[packet.ResponderCookie]
-	if sa == nil || sa.peer != addressKey(peer) {
+	if sa == nil {
 		return ControlPlaneResult{}, ErrUnknownSA
 	}
+	migratePeer := false
+	if sa.peer != addressKey(peer) {
+		migrated, ok := addressPort(peer)
+		if !viaNATT || !ok || !migrated.Addr().IsValid() || migrated.Addr() != sa.peerIP || !sa.main.NATTraversal() {
+			return ControlPlaneResult{}, ErrUnknownSA
+		}
+		migratePeer = true
+	}
 	if reply, ok := sa.responses[string(wire)]; ok {
+		if migratePeer {
+			sa.peer = addressKey(peer)
+		}
 		return ControlPlaneResult{Reply: append([]byte(nil), reply...)}, nil
 	}
 	var reply []byte
@@ -165,6 +196,9 @@ func (c *ControlPlane) HandleDatagram(peer net.Addr, wire []byte, now time.Time)
 	if err != nil {
 		return ControlPlaneResult{}, err
 	}
+	if migratePeer {
+		sa.peer = addressKey(peer)
+	}
 	sa.cacheResponse(wire, reply)
 	sa.updated = now
 	return ControlPlaneResult{Reply: append([]byte(nil), reply...), Established: established}, nil
@@ -208,4 +242,16 @@ func addressKey(peer net.Addr) string {
 		return ""
 	}
 	return peer.Network() + "\x00" + peer.String()
+}
+
+func addressPort(peer net.Addr) (netip.AddrPort, bool) {
+	udp, ok := peer.(*net.UDPAddr)
+	if !ok || udp == nil || udp.Port < 0 || udp.Port > 65535 {
+		return netip.AddrPort{}, false
+	}
+	address, ok := netip.AddrFromSlice(udp.IP)
+	if !ok {
+		return netip.AddrPort{}, false
+	}
+	return netip.AddrPortFrom(address.Unmap(), uint16(udp.Port)), true
 }

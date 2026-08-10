@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"l2tp-go/protocol/esp"
+	"l2tp-go/protocol/isakmp"
 )
 
 type ESPResultHandler func(context.Context, ESPBridgeResult) error
@@ -14,8 +15,10 @@ type ESPResultHandler func(context.Context, ESPBridgeResult) error
 type ESPTransportServer struct {
 	Conn         net.PacketConn
 	Bridge       *ESPBridge
+	ControlPlane *isakmp.ControlPlane
 	NATT         bool
 	HandleResult ESPResultHandler
+	Established  IKEEstablishedHandler
 }
 
 func ListenRawESP(address string, bridge *ESPBridge) (*ESPTransportServer, error) {
@@ -26,11 +29,17 @@ func ListenRawESP(address string, bridge *ESPBridge) (*ESPTransportServer, error
 	return &ESPTransportServer{Conn: conn, Bridge: bridge}, nil
 }
 func ListenNATT(address string, bridge *ESPBridge) (*ESPTransportServer, error) {
+	return ListenNATTWithIKE(address, bridge, nil)
+}
+
+// ListenNATTWithIKE binds the shared RFC 3948 UDP/4500 socket. IKE packets
+// carry the Non-ESP Marker; all other sufficiently large datagrams are ESP.
+func ListenNATTWithIKE(address string, bridge *ESPBridge, control *isakmp.ControlPlane) (*ESPTransportServer, error) {
 	conn, err := net.ListenPacket("udp", address)
 	if err != nil {
 		return nil, err
 	}
-	return &ESPTransportServer{Conn: conn, Bridge: bridge, NATT: true}, nil
+	return &ESPTransportServer{Conn: conn, Bridge: bridge, ControlPlane: control, NATT: true}, nil
 }
 
 func (s *ESPTransportServer) Serve(ctx context.Context) error {
@@ -56,10 +65,31 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 		wire := buffer[:n]
 		if s.NATT {
 			kind, payload := esp.ClassifyNATT(wire)
-			if kind != esp.NATTESP {
+			switch kind {
+			case esp.NATTKeepalive:
+				continue
+			case esp.NATTIKE:
+				if s.ControlPlane == nil {
+					continue
+				}
+				result, err := s.ControlPlane.HandleNATTDatagram(peer, payload, time.Now())
+				if err != nil {
+					continue
+				}
+				if len(result.Reply) != 0 {
+					if _, err := s.Conn.WriteTo(esp.EncapsulateNATTIKE(result.Reply), peer); err != nil {
+						return err
+					}
+				}
+				if result.Established != nil && s.Established != nil {
+					s.Established(ctx, peer, *result.Established)
+				}
+				continue
+			case esp.NATTESP:
+				wire = payload
+			default:
 				continue
 			}
-			wire = payload
 		}
 		result, err := s.Bridge.Handle(peer, wire, time.Now())
 		if err != nil {

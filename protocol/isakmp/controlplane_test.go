@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -70,5 +71,28 @@ func TestControlSAResponseCacheIsBounded(t *testing.T) {
 	}
 	if got := sa.responses[string([]byte{9})]; !bytes.Equal(got, []byte{10}) {
 		t.Fatalf("reply=%x", got)
+	}
+}
+
+func TestControlPlaneAllowsAuthenticatedNATTPortMigration(t *testing.T) {
+	cookie := Cookie{9}
+	main := &MainModeResponder{state: MainModeEstablished, capabilities: PeerCapabilities{NATTRFC3947: true}, nat: NATDetection{RemoteNAT: true}, natDetectionComplete: true}
+	sa := &controlSA{peer: addressKey(&net.UDPAddr{IP: net.IPv4(198, 51, 100, 20), Port: 500}), peerIP: netip.MustParseAddr("198.51.100.20"), main: main, quick: make(map[uint32]*QuickModeResponder), quickUpdated: make(map[uint32]time.Time), responses: make(map[string][]byte), expires: time.Now().Add(time.Hour)}
+	control := &ControlPlane{config: ControlPlaneConfig{HandshakeTimeout: time.Minute, QuickModeTimeout: time.Minute}, sas: map[Cookie]*controlSA{cookie: sa}}
+	wire, _ := (Packet{InitiatorCookie: Cookie{1}, ResponderCookie: cookie, Exchange: ExchangeIdentityProtect}).MarshalBinary()
+	peer4500 := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 20), Port: 62000}
+	if _, err := control.HandleNATTDatagram(peer4500, wire, time.Now()); !errors.Is(err, ErrUnexpectedExchange) {
+		t.Fatalf("migration error=%v", err)
+	}
+	if sa.peer == addressKey(peer4500) {
+		t.Fatal("failed authentication committed the migrated peer")
+	}
+	sa.responses[string(wire)] = []byte{1} // A cached response proves prior authentication.
+	if _, err := control.HandleNATTDatagram(peer4500, wire, time.Now()); err != nil || sa.peer != addressKey(peer4500) {
+		t.Fatalf("authenticated migration peer=%q error=%v", sa.peer, err)
+	}
+	wrongIP := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 21), Port: 4500}
+	if _, err := control.HandleNATTDatagram(wrongIP, wire, time.Now()); !errors.Is(err, ErrUnknownSA) {
+		t.Fatalf("wrong-IP migration error=%v", err)
 	}
 }

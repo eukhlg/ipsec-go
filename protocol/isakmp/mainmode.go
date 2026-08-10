@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 )
 
 var ErrUnexpectedExchange = errors.New("isakmp: unexpected exchange message")
@@ -22,10 +23,11 @@ const (
 )
 
 type MainModeConfig struct {
-	PreSharedKey []byte
-	ResponderID  Identification
-	Random       io.Reader
-	NonceSize    int
+	PreSharedKey                  []byte
+	ResponderID                   Identification
+	LocalEndpoint, RemoteEndpoint netip.AddrPort
+	Random                        io.Reader
+	NonceSize                     int
 }
 
 type MainModeResponder struct {
@@ -41,6 +43,8 @@ type MainModeResponder struct {
 	secrets                          Phase1Secrets
 	cipher                           *CBCContext
 	capabilities                     PeerCapabilities
+	nat                              NATDetection
+	natDetectionComplete             bool
 }
 
 func NewMainModeResponder(config MainModeConfig) (*MainModeResponder, error) {
@@ -63,10 +67,14 @@ func NewMainModeResponder(config MainModeConfig) (*MainModeResponder, error) {
 	return &MainModeResponder{config: config}, nil
 }
 
-func (r *MainModeResponder) State() MainModeState           { return r.state }
-func (r *MainModeResponder) Transform() Phase1Transform     { return r.transform }
-func (r *MainModeResponder) Cookies() (Cookie, Cookie)      { return r.initiatorCookie, r.responderCookie }
-func (r *MainModeResponder) Capabilities() PeerCapabilities { return r.capabilities }
+func (r *MainModeResponder) State() MainModeState               { return r.state }
+func (r *MainModeResponder) Transform() Phase1Transform         { return r.transform }
+func (r *MainModeResponder) Cookies() (Cookie, Cookie)          { return r.initiatorCookie, r.responderCookie }
+func (r *MainModeResponder) Capabilities() PeerCapabilities     { return r.capabilities }
+func (r *MainModeResponder) NATDetection() (NATDetection, bool) { return r.nat, r.natDetectionComplete }
+func (r *MainModeResponder) NATTraversal() bool {
+	return r.capabilities.NATTRFC3947 && r.natDetectionComplete && (r.nat.LocalNAT || r.nat.RemoteNAT)
+}
 func (r *MainModeResponder) Secrets() (Phase1Secrets, bool) {
 	if r.state != MainModeEstablished {
 		return Phase1Secrets{}, false
@@ -78,7 +86,11 @@ func (r *MainModeResponder) NewQuickModeResponder(random io.Reader) (*QuickModeR
 	if r.state != MainModeEstablished {
 		return nil, ErrUnexpectedExchange
 	}
-	return NewQuickModeResponder(QuickModeConfig{Transform: r.transform, Secrets: r.secrets, InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, LastPhase1Block: r.cipher.CurrentIV(), Random: random})
+	encapsulation := uint16(EncapsulationTransport)
+	if r.NATTraversal() {
+		encapsulation = EncapsulationNATTTransport
+	}
+	return NewQuickModeResponder(QuickModeConfig{Transform: r.transform, Secrets: r.secrets, InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, LastPhase1Block: r.cipher.CurrentIV(), Random: random, Encapsulation: encapsulation})
 }
 
 func (r *MainModeResponder) Handle(wire []byte) ([]byte, error) {
@@ -134,6 +146,9 @@ func (r *MainModeResponder) handleSA(packet Packet, wire []byte) ([]byte, error)
 	if r.capabilities.MicrosoftL2TP {
 		replyPayloads = append(replyPayloads, DataPayload{Kind: PayloadVendorID, Data: VendorMicrosoftL2TP})
 	}
+	if r.capabilities.NATTRFC3947 {
+		replyPayloads = append(replyPayloads, DataPayload{Kind: PayloadVendorID, Data: VendorNATTRFC3947})
+	}
 	return (Packet{InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, Exchange: ExchangeIdentityProtect, Payloads: replyPayloads}).MarshalBinary()
 }
 
@@ -172,9 +187,38 @@ func (r *MainModeResponder) handleKeyExchange(packet Packet) ([]byte, error) {
 		return nil, err
 	}
 	r.state = MainModeAwaitAuthentication
-	return (Packet{InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, Exchange: ExchangeIdentityProtect, Payloads: []Payload{
+	replyPayloads := []Payload{
 		DataPayload{Kind: PayloadKeyExchange, Data: r.responderPublic}, DataPayload{Kind: PayloadNonce, Data: r.responderNonce},
-	}}).MarshalBinary()
+	}
+	if r.capabilities.NATTRFC3947 && r.config.LocalEndpoint.IsValid() && r.config.RemoteEndpoint.IsValid() {
+		if countNATDPayloads(packet.Payloads[2:]) >= 2 {
+			r.nat, err = DetectNAT(r.transform.Hash, r.initiatorCookie, r.responderCookie, r.config.LocalEndpoint, r.config.RemoteEndpoint, packet.Payloads[2:])
+			if err != nil {
+				return nil, err
+			}
+			r.natDetectionComplete = true
+		}
+		remoteHash, err := NATDHash(r.transform.Hash, r.initiatorCookie, r.responderCookie, r.config.RemoteEndpoint)
+		if err != nil {
+			return nil, err
+		}
+		localHash, err := NATDHash(r.transform.Hash, r.initiatorCookie, r.responderCookie, r.config.LocalEndpoint)
+		if err != nil {
+			return nil, err
+		}
+		replyPayloads = append(replyPayloads, DataPayload{Kind: PayloadNATD, Data: remoteHash}, DataPayload{Kind: PayloadNATD, Data: localHash})
+	}
+	return (Packet{InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, Exchange: ExchangeIdentityProtect, Payloads: replyPayloads}).MarshalBinary()
+}
+
+func countNATDPayloads(payloads []Payload) int {
+	count := 0
+	for _, payload := range payloads {
+		if data, ok := payload.(DataPayload); ok && data.Kind == PayloadNATD {
+			count++
+		}
+	}
+	return count
 }
 
 func (r *MainModeResponder) handleAuthentication(packet Packet) ([]byte, error) {

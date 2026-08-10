@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -69,5 +70,48 @@ func TestNATTServerProtectedL2TPHandshake(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("server did not stop")
+	}
+}
+
+func TestNATTServerDemuxesIKEAndKeepalive(t *testing.T) {
+	control, err := isakmp.NewControlPlane(isakmp.ControlPlaneConfig{
+		PreSharedKey: []byte("psk"), ResponderID: isakmp.Identification{IDType: isakmp.IDIPv4Address, Data: []byte{192, 0, 2, 1}},
+		ResponderEndpoint: netip.MustParseAddrPort("192.0.2.1:500"), Random: bytes.NewReader(bytes.Repeat([]byte{0x77}, 2048)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge, _ := NewESPBridge(NewEngine(Config{HostName: "server"}), NewESPRegistry())
+	listener, err := ListenNATTWithIKE("127.0.0.1:0", bridge, control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = listener.Serve(ctx) }()
+	client, err := net.DialUDP("udp", nil, listener.Conn.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_, _ = client.Write([]byte{0xff})
+	transform := isakmp.Transform{Number: 1, ID: isakmp.TransformIKE, Attributes: []isakmp.Attribute{
+		isakmp.TVAttribute(isakmp.AttributeP1Encryption, isakmp.EncryptionAESCBC), isakmp.TVAttribute(isakmp.AttributeP1Hash, isakmp.HashSHA1),
+		isakmp.TVAttribute(isakmp.AttributeP1AuthMethod, isakmp.AuthPreSharedKey), isakmp.TVAttribute(isakmp.AttributeP1DHGroup, isakmp.DHGroup2), isakmp.TVAttribute(isakmp.AttributeP1KeyLength, 128),
+	}}
+	sa := isakmp.SecurityAssociation{DOI: isakmp.DOIIPsec, Situation: isakmp.SituationIdentityOnly, Proposals: []isakmp.Proposal{{Number: 1, ProtocolID: isakmp.ProtocolIKE, Transforms: []isakmp.Transform{transform}}}}
+	request, _ := (isakmp.Packet{InitiatorCookie: isakmp.Cookie{1}, Exchange: isakmp.ExchangeIdentityProtect, Payloads: []isakmp.Payload{sa}}).MarshalBinary()
+	_, _ = client.Write(esp.EncapsulateNATTIKE(request))
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buffer := make([]byte, 4096)
+	n, err := client.Read(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kind, reply := esp.ClassifyNATT(buffer[:n])
+	packet, decodeErr := isakmp.DecodePacket(reply)
+	if kind != esp.NATTIKE || decodeErr != nil || packet.ResponderCookie == (isakmp.Cookie{}) {
+		t.Fatalf("kind=%d packet=%#v error=%v", kind, packet, decodeErr)
 	}
 }

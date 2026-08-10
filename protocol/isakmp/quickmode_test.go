@@ -102,14 +102,17 @@ func TestQuickModeRejectsUnsafeSelectorAndClearsState(t *testing.T) {
 	}
 }
 
-func TestQuickModeDoesNotSelectNATTBeforePortMigration(t *testing.T) {
+func TestQuickModeSelectsNATTOnlyAfterNegotiation(t *testing.T) {
 	transform := Transform{Number: 1, ID: TransformESPAES, Attributes: []Attribute{
 		TVAttribute(AttributeP2Encapsulation, EncapsulationNATTTransport),
 		TVAttribute(AttributeP2Authentication, ESPAuthHMACSHA196),
 		TVAttribute(AttributeP2KeyLength, 128),
 	}}
 	sa := SecurityAssociation{DOI: DOIIPsec, Situation: SituationIdentityOnly, Proposals: []Proposal{{Number: 1, ProtocolID: ProtocolESP, SPI: []byte{1, 2, 3, 4}, Transforms: []Transform{transform}}}}
-	if _, _, _, _, err := selectESPsa(sa, bytes.NewReader(bytes.Repeat([]byte{1}, 32))); err != ErrUnsupportedTransform {
+	if _, _, _, _, err := selectESPsa(sa, EncapsulationTransport, bytes.NewReader(bytes.Repeat([]byte{1}, 32))); err != ErrUnsupportedTransform {
 		t.Fatalf("error=%v", err)
+	}
+	if _, selected, _, _, err := selectESPsa(sa, EncapsulationNATTTransport, bytes.NewReader(bytes.Repeat([]byte{1}, 32))); err != nil || selected.Encapsulation != EncapsulationNATTTransport {
+		t.Fatalf("selected=%#v error=%v", selected, err)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"net"
+	"net/netip"
 	"testing"
 )
 
@@ -96,6 +97,47 @@ func TestMainModeResponderTranscript(t *testing.T) {
 	}
 	if _, ok := responder.Secrets(); !ok {
 		t.Fatal("secrets unavailable")
+	}
+}
+
+func TestMainModeNegotiatesRFC3947AndDetectsRemoteNAT(t *testing.T) {
+	local := netip.MustParseAddrPort("192.0.2.1:500")
+	observedRemote := netip.MustParseAddrPort("198.51.100.20:500")
+	clientInternal := netip.MustParseAddrPort("10.0.0.20:500")
+	serverID := Identification{IDType: IDIPv4Address, ProtocolID: 17, Port: 500, Data: local.Addr().AsSlice()}
+	responder, err := NewMainModeResponder(MainModeConfig{PreSharedKey: []byte("test psk"), ResponderID: serverID, LocalEndpoint: local, RemoteEndpoint: observedRemote, Random: bytes.NewReader(bytes.Repeat([]byte{0x42}, 2048))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ci := Cookie{1, 2, 3, 4, 5, 6, 7, 8}
+	sa := SecurityAssociation{DOI: DOIIPsec, Situation: SituationIdentityOnly, Proposals: []Proposal{{Number: 1, ProtocolID: ProtocolIKE, Transforms: []Transform{phase1Transform(EncryptionAESCBC, HashSHA1, DHGroup2, 128)}}}}
+	message1, _ := (Packet{InitiatorCookie: ci, Exchange: ExchangeIdentityProtect, Payloads: []Payload{sa, DataPayload{Kind: PayloadVendorID, Data: VendorNATTRFC3947}}}).MarshalBinary()
+	wire2, err := responder.Handle(message1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message2, _ := DecodePacket(wire2)
+	if len(message2.Payloads) != 2 || !bytes.Equal(message2.Payloads[1].(DataPayload).Data, VendorNATTRFC3947) {
+		t.Fatalf("NAT-T vendor ID not advertised: %#v", message2.Payloads)
+	}
+	clientDH, _ := NewDHExchange(DHGroup2, bytes.NewReader(bytes.Repeat([]byte{0x24}, 512)))
+	localHash, _ := NATDHash(HashSHA1, ci, message2.ResponderCookie, local)
+	internalHash, _ := NATDHash(HashSHA1, ci, message2.ResponderCookie, clientInternal)
+	message3, _ := (Packet{InitiatorCookie: ci, ResponderCookie: message2.ResponderCookie, Exchange: ExchangeIdentityProtect, Payloads: []Payload{
+		DataPayload{Kind: PayloadKeyExchange, Data: clientDH.Public()}, DataPayload{Kind: PayloadNonce, Data: bytes.Repeat([]byte{0x11}, 20)},
+		DataPayload{Kind: PayloadNATD, Data: internalHash}, DataPayload{Kind: PayloadNATD, Data: localHash},
+	}}).MarshalBinary()
+	wire4, err := responder.Handle(message3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message4, _ := DecodePacket(wire4)
+	detection, ok := responder.NATDetection()
+	if !ok || detection.LocalNAT || !detection.RemoteNAT || !responder.NATTraversal() {
+		t.Fatalf("detection=%#v complete=%v", detection, ok)
+	}
+	if len(message4.Payloads) != 4 || message4.Payloads[2].Type() != PayloadNATD || message4.Payloads[3].Type() != PayloadNATD {
+		t.Fatalf("NAT-D response payloads=%#v", message4.Payloads)
 	}
 }
 
