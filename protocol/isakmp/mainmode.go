@@ -96,6 +96,13 @@ func (r *MainModeResponder) NewQuickModeResponder(random io.Reader) (*QuickModeR
 	return NewQuickModeResponder(QuickModeConfig{Transform: r.transform, Secrets: r.secrets, InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, LastPhase1Block: r.cipher.CurrentIV(), Random: random, Encapsulation: encapsulation, Lifetime: r.config.ESPLifetime, OriginalInitiator: r.config.RemoteEndpoint.Addr(), OriginalResponder: r.config.LocalEndpoint.Addr()})
 }
 
+func (r *MainModeResponder) NewQuickModeInitiator(random io.Reader, messageID uint32, previous ESPPair) (*QuickModeInitiator, error) {
+	if r.state != MainModeEstablished {
+		return nil, ErrUnexpectedExchange
+	}
+	return NewQuickModeInitiator(QuickModeInitiatorConfig{Transform: r.transform, Secrets: r.secrets, InitiatorCookie: r.initiatorCookie, ResponderCookie: r.responderCookie, LastPhase1Block: r.cipher.CurrentIV(), Random: random, MessageID: messageID, Previous: previous, Lifetime: r.config.ESPLifetime})
+}
+
 func (r *MainModeResponder) Handle(wire []byte) ([]byte, error) {
 	packet, err := DecodePacket(wire)
 	if err != nil {

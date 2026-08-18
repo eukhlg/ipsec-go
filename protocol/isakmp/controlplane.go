@@ -68,6 +68,7 @@ type controlSA struct {
 	natt           bool
 	main           *MainModeResponder
 	quick          map[uint32]*QuickModeResponder
+	quickInitiated map[uint32]*QuickModeInitiator
 	quickUpdated   map[uint32]time.Time
 	responses      map[string][]byte
 	responseOrder  []string
@@ -77,6 +78,8 @@ type controlSA struct {
 	dpdSequence    uint32
 	dpdOutstanding bool
 	dpdFailures    int
+	activePair     ESPPair
+	nextRekey      time.Time
 }
 
 type ControlPlane struct {
@@ -182,7 +185,7 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 		if seconds := main.Transform().LifetimeSeconds; seconds != 0 && time.Duration(seconds)*time.Second < lifetime {
 			lifetime = time.Duration(seconds) * time.Second
 		}
-		runtime := &controlSA{peer: addressKey(peer), peerIP: remoteEndpoint.Addr(), peerAddr: cloneNetAddr(peer), natt: viaNATT, main: main, quick: make(map[uint32]*QuickModeResponder), quickUpdated: make(map[uint32]time.Time), responses: make(map[string][]byte), updated: now, expires: now.Add(lifetime)}
+		runtime := &controlSA{peer: addressKey(peer), peerIP: remoteEndpoint.Addr(), peerAddr: cloneNetAddr(peer), natt: viaNATT, main: main, quick: make(map[uint32]*QuickModeResponder), quickInitiated: make(map[uint32]*QuickModeInitiator), quickUpdated: make(map[uint32]time.Time), responses: make(map[string][]byte), updated: now, expires: now.Add(lifetime)}
 		runtime.cacheResponse(wire, reply)
 		c.sas[responderCookie] = runtime
 		selected := main.Transform()
@@ -219,6 +222,22 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 			delete(c.sas, packet.ResponderCookie)
 		}
 	case ExchangeQuickMode:
+		if initiated := sa.quickInitiated[packet.MessageID]; initiated != nil {
+			reply, pair, initiateErr := initiated.Handle(wire)
+			initiated.Close()
+			if initiateErr != nil {
+				delete(sa.quickInitiated, packet.MessageID)
+				delete(sa.quickUpdated, packet.MessageID)
+				return ControlPlaneResult{}, initiateErr
+			}
+			delete(sa.quickInitiated, packet.MessageID)
+			delete(sa.quickUpdated, packet.MessageID)
+			sa.recordPair(pair, now)
+			sa.cacheResponse(wire, reply)
+			sa.updated = now
+			c.debug("quick proactive established peer=%s message_id=%08x inbound_spi=%08x outbound_spi=%08x", peer, packet.MessageID, pair.Inbound.SPI, pair.Outbound.SPI)
+			return ControlPlaneResult{Reply: reply, Established: &pair}, nil
+		}
 		quick := sa.quick[packet.MessageID]
 		if quick == nil {
 			quick, err = sa.main.NewQuickModeResponder(c.config.Random)
@@ -241,6 +260,7 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 			sa.quickUpdated[packet.MessageID] = now
 			if pair, ok := quick.Pair(); ok {
 				established = &pair
+				sa.recordPair(pair, now)
 				c.debug("quick established peer=%s message_id=%08x inbound_spi=%08x outbound_spi=%08x encryption=%d key_bits=%d encapsulation=%d lifetime=%ds", peer, packet.MessageID, pair.Inbound.SPI, pair.Outbound.SPI, pair.Transform.Encryption, pair.Transform.KeyBits, pair.Transform.Encapsulation, pair.Transform.LifetimeSeconds)
 				quick.Close()
 				delete(sa.quick, packet.MessageID)
@@ -399,6 +419,37 @@ func (c *ControlPlane) PollDPD(now time.Time) []ControlDatagram {
 	return datagrams
 }
 
+// PollRekey starts a replacement child SA before the negotiated ESP lifetime
+// expires. The old SA remains installed until the authenticated exchange ends.
+func (c *ControlPlane) PollRekey(now time.Time) []ControlDatagram {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var datagrams []ControlDatagram
+	for cookie, sa := range c.sas {
+		if sa.main.State() != MainModeEstablished || sa.peerAddr == nil || sa.activePair.Transform.Encryption == 0 || sa.nextRekey.IsZero() || now.Before(sa.nextRekey) || len(sa.quickInitiated) != 0 {
+			continue
+		}
+		messageID, err := c.newMessageID(0)
+		if err != nil {
+			continue
+		}
+		quick, err := sa.main.NewQuickModeInitiator(c.config.Random, messageID, sa.activePair)
+		if err != nil {
+			continue
+		}
+		wire, err := quick.Start()
+		if err != nil {
+			quick.Close()
+			continue
+		}
+		sa.quickInitiated[messageID] = quick
+		sa.quickUpdated[messageID] = now
+		datagrams = append(datagrams, ControlDatagram{Peer: cloneNetAddr(sa.peerAddr), Payload: wire, NATT: sa.natt})
+		c.debug("quick proactive tx peer=%s responder_cookie=%x message_id=%08x", sa.peerAddr, cookie, messageID)
+	}
+	return datagrams
+}
+
 func (c *ControlPlane) debug(format string, args ...any) {
 	if c.config.Debugf != nil {
 		c.config.Debugf(format, args...)
@@ -428,9 +479,21 @@ func (c *ControlPlane) expire(now time.Time) {
 				delete(sa.quickUpdated, messageID)
 			}
 		}
+		for messageID := range sa.quickInitiated {
+			if now.Sub(sa.quickUpdated[messageID]) >= c.config.QuickModeTimeout {
+				sa.quickInitiated[messageID].Close()
+				delete(sa.quickInitiated, messageID)
+				delete(sa.quickUpdated, messageID)
+				// Retry on the next maintenance tick while the current child SA is usable.
+				sa.nextRekey = now
+			}
+		}
 		handshakeExpired := sa.main.State() != MainModeEstablished && now.Sub(sa.updated) >= c.config.HandshakeTimeout
 		if handshakeExpired || !now.Before(sa.expires) {
 			for _, quick := range sa.quick {
+				quick.Close()
+			}
+			for _, quick := range sa.quickInitiated {
 				quick.Close()
 			}
 			sa.main.Close()
@@ -469,6 +532,9 @@ func (c *ControlPlane) Shutdown() []ControlDatagram {
 		for _, quick := range sa.quick {
 			quick.Close()
 		}
+		for _, quick := range sa.quickInitiated {
+			quick.Close()
+		}
 		sa.main.Close()
 		delete(c.sas, cookie)
 	}
@@ -488,6 +554,19 @@ func (sa *controlSA) cacheResponse(request, reply []byte) {
 		sa.responseOrder = sa.responseOrder[1:]
 		delete(sa.responses, old)
 	}
+}
+
+func (sa *controlSA) recordPair(pair ESPPair, now time.Time) {
+	sa.activePair = clonePair(pair)
+	lifetime := time.Duration(pair.Transform.LifetimeSeconds) * time.Second
+	if lifetime <= 0 {
+		return
+	}
+	lead := lifetime / 10
+	if lead < time.Second {
+		lead = time.Second
+	}
+	sa.nextRekey = now.Add(lifetime - lead)
 }
 func addressKey(peer net.Addr) string {
 	if peer == nil {

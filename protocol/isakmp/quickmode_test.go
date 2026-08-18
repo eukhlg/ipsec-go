@@ -76,6 +76,44 @@ func TestQuickModeResponderTranscript(t *testing.T) {
 	}
 }
 
+func TestQuickModeInitiatorTranscript(t *testing.T) {
+	phase1 := Phase1Transform{Encryption: EncryptionAESCBC, Hash: HashSHA1, AuthMethod: AuthPreSharedKey, DHGroup: DHGroup2, KeyBits: 128}
+	secrets := Phase1Secrets{SKEYIDa: bytes.Repeat([]byte{0x11}, 20), SKEYIDd: bytes.Repeat([]byte{0x22}, 20), Key: bytes.Repeat([]byte{0x33}, 16)}
+	ci, cr := Cookie{1}, Cookie{2}
+	lastBlock := bytes.Repeat([]byte{0x44}, 16)
+	previous := ESPPair{Transform: ESPTransform{Encryption: TransformESPAES, Authentication: ESPAuthHMACSHA196, Encapsulation: EncapsulationTransport, KeyBits: 128, LifetimeSeconds: 3600}}
+	initiator, err := NewQuickModeInitiator(QuickModeInitiatorConfig{Transform: phase1, Secrets: secrets, InitiatorCookie: ci, ResponderCookie: cr, LastPhase1Block: lastBlock, Random: bytes.NewReader(bytes.Repeat([]byte{0x31}, 512)), MessageID: 0x10203040, Previous: previous, Lifetime: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	responder, err := NewQuickModeResponder(QuickModeConfig{Transform: phase1, Secrets: secrets, InitiatorCookie: ci, ResponderCookie: cr, LastPhase1Block: lastBlock, Random: bytes.NewReader(bytes.Repeat([]byte{0x52}, 512)), Lifetime: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message1, err := initiator.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	message2, err := responder.Handle(message1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message3, initiatedPair, err := initiator.Handle(message2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply, err := responder.Handle(message3); err != nil || reply != nil {
+		t.Fatalf("reply=%x err=%v", reply, err)
+	}
+	respondedPair, ok := responder.Pair()
+	if !ok {
+		t.Fatal("responder pair unavailable")
+	}
+	if initiatedPair.Inbound.SPI != respondedPair.Outbound.SPI || initiatedPair.Outbound.SPI != respondedPair.Inbound.SPI || !bytes.Equal(initiatedPair.Inbound.EncryptionKey, respondedPair.Outbound.EncryptionKey) || !bytes.Equal(initiatedPair.Outbound.AuthenticationKey, respondedPair.Inbound.AuthenticationKey) {
+		t.Fatalf("initiator=%#v responder=%#v", initiatedPair, respondedPair)
+	}
+}
+
 func TestQuickModeRejectsUnsafeSelectorAndClearsState(t *testing.T) {
 	phase1 := Phase1Transform{Encryption: EncryptionAESCBC, Hash: HashSHA1, AuthMethod: AuthPreSharedKey, DHGroup: DHGroup2, KeyBits: 128}
 	secrets := Phase1Secrets{SKEYIDa: bytes.Repeat([]byte{0x11}, 20), SKEYIDd: bytes.Repeat([]byte{0x22}, 20), Key: bytes.Repeat([]byte{0x33}, 16)}
