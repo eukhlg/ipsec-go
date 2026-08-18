@@ -6,7 +6,7 @@ import (
 	"net"
 	"time"
 
-	"l2tp-go/protocol/isakmp"
+	"github.com/eukhlg/l2tp-go/protocol/isakmp"
 )
 
 type IKEEstablishedHandler func(context.Context, net.Addr, isakmp.ESPPair)
@@ -36,12 +36,22 @@ func ListenIKE(address string, config isakmp.ControlPlaneConfig) (*IKEServer, er
 // ListenIKEWithControl binds an IKE socket to an existing control plane. It is
 // used by UDP/500 and the shared UDP/4500 NAT-T demultiplexer.
 func ListenIKEWithControl(address string, control *isakmp.ControlPlane) (*IKEServer, error) {
-	if control == nil {
-		return nil, errors.New("ike server: missing control plane")
-	}
 	conn, err := net.ListenPacket("udp", address)
 	if err != nil {
 		return nil, err
+	}
+	server, err := NewIKEServer(conn, control)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return server, nil
+}
+
+// NewIKEServer creates an IKE server over a caller-owned packet connection.
+func NewIKEServer(conn net.PacketConn, control *isakmp.ControlPlane) (*IKEServer, error) {
+	if conn == nil || control == nil {
+		return nil, errors.New("ike server: packet connection and control plane are required")
 	}
 	return &IKEServer{Conn: conn, ControlPlane: control}, nil
 }

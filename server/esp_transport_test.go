@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"l2tp-go/protocol/esp"
-	"l2tp-go/protocol/isakmp"
-	"l2tp-go/protocol/l2tp"
+	"github.com/eukhlg/l2tp-go/protocol/esp"
+	"github.com/eukhlg/l2tp-go/protocol/isakmp"
+	"github.com/eukhlg/l2tp-go/protocol/l2tp"
 )
 
 func TestNATTServerProtectedL2TPHandshake(t *testing.T) {

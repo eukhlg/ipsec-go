@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"l2tp-go/protocol/isakmp"
+	"github.com/eukhlg/l2tp-go/protocol/isakmp"
 )
 
 type Limits struct{ Packets, Bytes uint64 }

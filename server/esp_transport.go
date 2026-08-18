@@ -6,8 +6,8 @@ import (
 	"net"
 	"time"
 
-	"l2tp-go/protocol/esp"
-	"l2tp-go/protocol/isakmp"
+	"github.com/eukhlg/l2tp-go/protocol/esp"
+	"github.com/eukhlg/l2tp-go/protocol/isakmp"
 )
 
 type ESPResultHandler func(context.Context, ESPBridgeResult) error
@@ -29,7 +29,12 @@ func ListenRawESP(address string, bridge *ESPBridge) (*ESPTransportServer, error
 	if err != nil {
 		return nil, err
 	}
-	return &ESPTransportServer{Conn: conn, Bridge: bridge}, nil
+	server, err := NewRawESPServer(conn, bridge)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return server, nil
 }
 func ListenNATT(address string, bridge *ESPBridge) (*ESPTransportServer, error) {
 	return ListenNATTWithIKE(address, bridge, nil)
@@ -41,6 +46,28 @@ func ListenNATTWithIKE(address string, bridge *ESPBridge, control *isakmp.Contro
 	conn, err := net.ListenPacket("udp", address)
 	if err != nil {
 		return nil, err
+	}
+	server, err := NewNATTServer(conn, bridge, control)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return server, nil
+}
+
+// NewRawESPServer creates a raw ESP transport over an injected connection.
+func NewRawESPServer(conn net.PacketConn, bridge *ESPBridge) (*ESPTransportServer, error) {
+	if conn == nil || bridge == nil {
+		return nil, errors.New("esp server: packet connection and bridge are required")
+	}
+	return &ESPTransportServer{Conn: conn, Bridge: bridge}, nil
+}
+
+// NewNATTServer creates a UDP/4500 ESP transport over an injected connection.
+// control may be nil when IKE demultiplexing is handled by the embedder.
+func NewNATTServer(conn net.PacketConn, bridge *ESPBridge, control *isakmp.ControlPlane) (*ESPTransportServer, error) {
+	if conn == nil || bridge == nil {
+		return nil, errors.New("esp server: packet connection and bridge are required")
 	}
 	return &ESPTransportServer{Conn: conn, Bridge: bridge, ControlPlane: control, NATT: true}, nil
 }

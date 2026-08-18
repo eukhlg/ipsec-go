@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"l2tp-go/protocol/esp"
-	"l2tp-go/protocol/isakmp"
+	"github.com/eukhlg/l2tp-go/protocol/esp"
+	"github.com/eukhlg/l2tp-go/protocol/isakmp"
 )
 
 var (

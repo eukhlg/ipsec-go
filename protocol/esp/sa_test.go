@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"l2tp-go/protocol/isakmp"
+	"github.com/eukhlg/l2tp-go/protocol/isakmp"
 )
 
 func testConfig(spi uint32) SAConfig {

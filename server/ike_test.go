@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"l2tp-go/protocol/isakmp"
+	"github.com/eukhlg/l2tp-go/protocol/isakmp"
 )
 
 func TestIKEServerSurvivesMalformedDatagramAndReplies(t *testing.T) {
