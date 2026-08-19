@@ -46,6 +46,7 @@ type MainModeResponder struct {
 	secrets                          Phase1Secrets
 	cipher                           *CBCContext
 	capabilities                     PeerCapabilities
+	peerIdentity                     Identification
 	nat                              NATDetection
 	natDetectionComplete             bool
 }
@@ -70,10 +71,18 @@ func NewMainModeResponder(config MainModeConfig) (*MainModeResponder, error) {
 	return &MainModeResponder{config: config}, nil
 }
 
-func (r *MainModeResponder) State() MainModeState               { return r.state }
-func (r *MainModeResponder) Transform() Phase1Transform         { return r.transform }
-func (r *MainModeResponder) Cookies() (Cookie, Cookie)          { return r.initiatorCookie, r.responderCookie }
-func (r *MainModeResponder) Capabilities() PeerCapabilities     { return r.capabilities }
+func (r *MainModeResponder) State() MainModeState           { return r.state }
+func (r *MainModeResponder) Transform() Phase1Transform     { return r.transform }
+func (r *MainModeResponder) Cookies() (Cookie, Cookie)      { return r.initiatorCookie, r.responderCookie }
+func (r *MainModeResponder) Capabilities() PeerCapabilities { return r.capabilities }
+func (r *MainModeResponder) PeerIdentity() (Identification, bool) {
+	if r.state != MainModeEstablished || r.peerIdentity.IDType == 0 {
+		return Identification{}, false
+	}
+	identity := r.peerIdentity
+	identity.Data = append([]byte(nil), identity.Data...)
+	return identity, true
+}
 func (r *MainModeResponder) NATDetection() (NATDetection, bool) { return r.nat, r.natDetectionComplete }
 func (r *MainModeResponder) NATTraversal() bool {
 	return r.capabilities.NATTRFC3947 && (r.config.ForceNATT || (r.natDetectionComplete && (r.nat.LocalNAT || r.nat.RemoteNAT)))
@@ -277,6 +286,8 @@ func (r *MainModeResponder) handleAuthentication(packet Packet) ([]byte, error) 
 		return nil, err
 	}
 	ciphertext := r.cipher.Encrypt(body)
+	r.peerIdentity = identity
+	r.peerIdentity.Data = append([]byte(nil), identity.Data...)
 	r.state = MainModeEstablished
 	zeroBytes(r.config.PreSharedKey)
 	r.config.PreSharedKey = nil
@@ -359,6 +370,8 @@ func (r *MainModeResponder) Close() {
 	zeroBytes(r.secrets.SKEYIDe)
 	zeroBytes(r.secrets.Key)
 	r.secrets = Phase1Secrets{}
+	zeroBytes(r.peerIdentity.Data)
+	r.peerIdentity = Identification{}
 	r.dh = nil
 	r.cipher = nil
 }

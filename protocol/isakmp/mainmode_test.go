@@ -90,6 +90,10 @@ func TestMainModeResponderTranscript(t *testing.T) {
 	if responder.State() != MainModeEstablished || len(payloads6) != 2 || payloads6[0].(Identification).IDType != IDIPv4Address {
 		t.Fatalf("state=%v payloads=%#v", responder.State(), payloads6)
 	}
+	peerIdentity, ok := responder.PeerIdentity()
+	if !ok || peerIdentity.IDType != clientID.IDType || peerIdentity.ProtocolID != clientID.ProtocolID || peerIdentity.Port != clientID.Port || !bytes.Equal(peerIdentity.Data, clientID.Data) {
+		t.Fatalf("peer identity=%#v available=%v", peerIdentity, ok)
+	}
 	serverIDBody, _ := serverID.marshalBody()
 	wantR, _ := MainModeHash(suite, secrets.SKEYID, clientDH.Public(), serverPublic, ci, message2.ResponderCookie, sai, serverIDBody, false)
 	if !bytes.Equal(payloads6[1].(DataPayload).Data, wantR) {

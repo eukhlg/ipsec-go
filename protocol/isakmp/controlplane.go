@@ -47,12 +47,14 @@ const (
 	LifecycleDeleteESP LifecycleEventType = iota + 1
 	LifecycleDeleteIKE
 	LifecycleExpireIKE
+	LifecycleRebindIKE
 )
 
 type LifecycleEvent struct {
-	Type            LifecycleEventType
-	ResponderCookie Cookie
-	SPIs            []uint32
+	Type              LifecycleEventType
+	ResponderCookie   Cookie
+	ReplacementCookie Cookie
+	SPIs              []uint32
 }
 
 type ControlDatagram struct {
@@ -73,13 +75,17 @@ type controlSA struct {
 	responses      map[string][]byte
 	responseOrder  []string
 	updated        time.Time
+	established    time.Time
 	expires        time.Time
+	softExpired    bool
 	nextDPD        time.Time
 	dpdSequence    uint32
 	dpdOutstanding bool
 	dpdFailures    int
 	activePair     ESPPair
 	nextRekey      time.Time
+	predecessors   []Cookie
+	successor      Cookie
 }
 
 type ControlPlane struct {
@@ -214,12 +220,17 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 	}
 	var reply []byte
 	var established *ESPPair
+	var lifecycle []LifecycleEvent
 	switch packet.Exchange {
 	case ExchangeIdentityProtect:
+		wasEstablished := sa.main.State() == MainModeEstablished
 		reply, err = sa.main.Handle(wire)
 		if err != nil && sa.main.State() == MainModeFailed {
-			sa.main.Close()
-			delete(c.sas, packet.ResponderCookie)
+			lifecycle = append(lifecycle, c.closeControlSA(packet.ResponderCookie)...)
+		}
+		if err == nil && !wasEstablished && sa.main.State() == MainModeEstablished {
+			sa.established = now
+			lifecycle = append(lifecycle, c.adoptPhase1Replacement(packet.ResponderCookie, sa)...)
 		}
 	case ExchangeQuickMode:
 		if initiated := sa.quickInitiated[packet.MessageID]; initiated != nil {
@@ -236,7 +247,7 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 			sa.cacheResponse(wire, reply)
 			sa.updated = now
 			c.debug("quick proactive established peer=%s message_id=%08x inbound_spi=%08x outbound_spi=%08x", peer, packet.MessageID, pair.Inbound.SPI, pair.Outbound.SPI)
-			return ControlPlaneResult{Reply: reply, Established: &pair}, nil
+			return ControlPlaneResult{Reply: reply, Established: &pair, Lifecycle: lifecycle}, nil
 		}
 		quick := sa.quick[packet.MessageID]
 		if quick == nil {
@@ -268,7 +279,6 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 			}
 		}
 	case ExchangeInformational:
-		var lifecycle []LifecycleEvent
 		reply, lifecycle, err = c.handleInformational(sa, packet.ResponderCookie, wire)
 		if err == nil {
 			sa.updated = now
@@ -279,8 +289,8 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 			if len(lifecycle) != 0 {
 				for _, event := range lifecycle {
 					if event.Type == LifecycleDeleteIKE {
-						sa.main.Close()
-						delete(c.sas, packet.ResponderCookie)
+						fallback := c.closeControlSA(packet.ResponderCookie)
+						lifecycle = append(fallback, lifecycle...)
 						break
 					}
 				}
@@ -307,7 +317,7 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 	if c.config.DPDInterval > 0 {
 		sa.nextDPD = now.Add(c.config.DPDInterval)
 	}
-	return ControlPlaneResult{Reply: append([]byte(nil), reply...), Established: established}, nil
+	return ControlPlaneResult{Reply: append([]byte(nil), reply...), Established: established, Lifecycle: lifecycle}, nil
 }
 
 func (c *ControlPlane) handleInformational(sa *controlSA, responderCookie Cookie, wire []byte) ([]byte, []LifecycleEvent, error) {
@@ -376,7 +386,7 @@ func (c *ControlPlane) PollDPD(now time.Time) []ControlDatagram {
 	}
 	var datagrams []ControlDatagram
 	for cookie, sa := range c.sas {
-		if sa.main.State() != MainModeEstablished || !sa.main.Capabilities().DPD || sa.peerAddr == nil {
+		if sa.main.State() != MainModeEstablished || !isZeroCookie(sa.successor) || !sa.main.Capabilities().DPD || sa.peerAddr == nil {
 			continue
 		}
 		if sa.nextDPD.IsZero() {
@@ -390,8 +400,7 @@ func (c *ControlPlane) PollDPD(now time.Time) []ControlDatagram {
 			sa.dpdFailures++
 			if sa.dpdFailures >= 3 {
 				c.debug("ipsec lifecycle DPD timeout peer=%s responder_cookie=%x", sa.peerAddr, cookie)
-				sa.main.Close()
-				delete(c.sas, cookie)
+				c.pending = append(c.pending, c.closeControlSA(cookie)...)
 				c.pending = append(c.pending, LifecycleEvent{Type: LifecycleExpireIKE, ResponderCookie: cookie})
 				continue
 			}
@@ -426,7 +435,7 @@ func (c *ControlPlane) PollRekey(now time.Time) []ControlDatagram {
 	defer c.mu.Unlock()
 	var datagrams []ControlDatagram
 	for cookie, sa := range c.sas {
-		if sa.main.State() != MainModeEstablished || sa.peerAddr == nil || sa.activePair.Transform.Encryption == 0 || sa.nextRekey.IsZero() || now.Before(sa.nextRekey) || len(sa.quickInitiated) != 0 {
+		if sa.main.State() != MainModeEstablished || !isZeroCookie(sa.successor) || sa.peerAddr == nil || sa.activePair.Transform.Encryption == 0 || sa.nextRekey.IsZero() || now.Before(sa.nextRekey) || len(sa.quickInitiated) != 0 {
 			continue
 		}
 		messageID, err := c.newMessageID(0)
@@ -488,16 +497,15 @@ func (c *ControlPlane) expire(now time.Time) {
 				sa.nextRekey = now
 			}
 		}
-		handshakeExpired := sa.main.State() != MainModeEstablished && now.Sub(sa.updated) >= c.config.HandshakeTimeout
-		if handshakeExpired || !now.Before(sa.expires) {
-			for _, quick := range sa.quick {
-				quick.Close()
-			}
-			for _, quick := range sa.quickInitiated {
-				quick.Close()
-			}
-			sa.main.Close()
-			delete(c.sas, cookie)
+		established := sa.main.State() == MainModeEstablished
+		handshakeExpired := !established && now.Sub(sa.updated) >= c.config.HandshakeTimeout
+		negotiationExpired := !established && !now.Before(sa.expires)
+		if established && !sa.softExpired && !now.Before(sa.expires) {
+			sa.softExpired = true
+			c.debug("ike phase1 soft lifetime reached peer=%s responder_cookie=%x; retaining SA while awaiting peer replacement", sa.peerAddr, cookie)
+		}
+		if handshakeExpired || negotiationExpired {
+			c.pending = append(c.pending, c.closeControlSA(cookie)...)
 			c.pending = append(c.pending, LifecycleEvent{Type: LifecycleExpireIKE, ResponderCookie: cookie})
 		}
 	}
@@ -529,14 +537,7 @@ func (c *ControlPlane) Shutdown() []ControlDatagram {
 				}
 			}
 		}
-		for _, quick := range sa.quick {
-			quick.Close()
-		}
-		for _, quick := range sa.quickInitiated {
-			quick.Close()
-		}
-		sa.main.Close()
-		delete(c.sas, cookie)
+		c.closeControlSA(cookie)
 	}
 	c.pending = nil
 	return datagrams
@@ -557,6 +558,7 @@ func (sa *controlSA) cacheResponse(request, reply []byte) {
 }
 
 func (sa *controlSA) recordPair(pair ESPPair, now time.Time) {
+	sa.clearPair()
 	sa.activePair = clonePair(pair)
 	lifetime := time.Duration(pair.Transform.LifetimeSeconds) * time.Second
 	if lifetime <= 0 {
@@ -567,6 +569,105 @@ func (sa *controlSA) recordPair(pair ESPPair, now time.Time) {
 		lead = time.Second
 	}
 	sa.nextRekey = now.Add(lifetime - lead)
+}
+
+func (sa *controlSA) clearPair() {
+	zeroBytes(sa.activePair.Inbound.EncryptionKey)
+	zeroBytes(sa.activePair.Inbound.AuthenticationKey)
+	zeroBytes(sa.activePair.Outbound.EncryptionKey)
+	zeroBytes(sa.activePair.Outbound.AuthenticationKey)
+	sa.activePair = ESPPair{}
+}
+
+func (c *ControlPlane) closeControlSA(cookie Cookie) []LifecycleEvent {
+	sa := c.sas[cookie]
+	if sa == nil {
+		return nil
+	}
+	var events []LifecycleEvent
+	var fallbackCookie Cookie
+	var fallback *controlSA
+	for _, predecessorCookie := range sa.predecessors {
+		if predecessor := c.sas[predecessorCookie]; predecessor != nil && predecessor.successor == cookie {
+			predecessor.successor = Cookie{}
+			if fallback == nil || predecessor.established.After(fallback.established) {
+				fallbackCookie, fallback = predecessorCookie, predecessor
+			}
+		}
+	}
+	if fallback != nil && sa.activePair.Transform.Encryption != 0 {
+		events = append(events, LifecycleEvent{Type: LifecycleRebindIKE, ResponderCookie: cookie, ReplacementCookie: fallbackCookie})
+		c.debug("ike phase1 child ownership restored from_cookie=%x to_cookie=%x", cookie, fallbackCookie)
+	}
+	if !isZeroCookie(sa.successor) {
+		if successor := c.sas[sa.successor]; successor != nil {
+			successor.predecessors = removeCookie(successor.predecessors, cookie)
+		}
+	}
+	for _, quick := range sa.quick {
+		quick.Close()
+	}
+	for _, quick := range sa.quickInitiated {
+		quick.Close()
+	}
+	sa.clearPair()
+	sa.main.Close()
+	delete(c.sas, cookie)
+	return events
+}
+
+// Keep multiple responder-created Phase 1 SAs for one authenticated client and
+// switch to the replacement after the peer completes a fresh Main Mode. Inherit
+// the active child association to the replacement without changing its keys,
+// SPIs, sequence numbers, or remaining lifetime.
+func (c *ControlPlane) adoptPhase1Replacement(cookie Cookie, replacement *controlSA) []LifecycleEvent {
+	replacementID, ok := replacement.main.PeerIdentity()
+	if !ok {
+		return nil
+	}
+	var newest *controlSA
+	var newestCookie Cookie
+	var events []LifecycleEvent
+	for candidateCookie, candidate := range c.sas {
+		if candidateCookie == cookie || candidate.main.State() != MainModeEstablished || candidate.peerIP != replacement.peerIP || !samePeerIdentity(candidate.main, replacementID) {
+			continue
+		}
+		replacement.predecessors = append(replacement.predecessors, candidateCookie)
+		candidate.successor = cookie
+		events = append(events, LifecycleEvent{Type: LifecycleRebindIKE, ResponderCookie: candidateCookie, ReplacementCookie: cookie})
+		if newest == nil || candidate.established.After(newest.established) {
+			newest, newestCookie = candidate, candidateCookie
+		}
+	}
+	if newest == nil {
+		return nil
+	}
+	if newest.activePair.Transform.Encryption != 0 {
+		replacement.activePair = clonePair(newest.activePair)
+		initiatorCookie, _ := replacement.main.Cookies()
+		replacement.activePair.InitiatorCookie = initiatorCookie
+		replacement.activePair.ResponderCookie = cookie
+		replacement.nextRekey = newest.nextRekey
+	}
+	c.debug("ike phase1 replacement established peer=%s predecessor_cookie=%x replacement_cookie=%x predecessors=%d", replacement.peerAddr, newestCookie, cookie, len(replacement.predecessors))
+	if newest.activePair.Transform.Encryption == 0 {
+		return events
+	}
+	return events
+}
+
+func samePeerIdentity(main *MainModeResponder, want Identification) bool {
+	got, ok := main.PeerIdentity()
+	return ok && got.IDType == want.IDType && got.ProtocolID == want.ProtocolID && got.Port == want.Port && bytes.Equal(got.Data, want.Data)
+}
+
+func removeCookie(cookies []Cookie, remove Cookie) []Cookie {
+	for i, cookie := range cookies {
+		if cookie == remove {
+			return append(cookies[:i], cookies[i+1:]...)
+		}
+	}
+	return cookies
 }
 func addressKey(peer net.Addr) string {
 	if peer == nil {

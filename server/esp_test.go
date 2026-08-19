@@ -108,6 +108,31 @@ func TestESPRegistryRekeyOverlapAndLifecycleRemoval(t *testing.T) {
 	}
 }
 
+func TestESPRegistryRebindPreservesChildWhenPredecessorIsRemoved(t *testing.T) {
+	peer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 4500}
+	oldCookie := isakmp.Cookie{1}
+	newCookie := isakmp.Cookie{2}
+	pair := testESPPair(isakmp.EncapsulationNATTTransport)
+	pair.ResponderCookie = oldCookie
+	registry := NewESPRegistry()
+	if err := registry.Install(peer, pair); err != nil {
+		t.Fatal(err)
+	}
+	registry.mu.RLock()
+	session := registry.bySPI[pair.Inbound.SPI]
+	registry.mu.RUnlock()
+
+	registry.RebindIKE(oldCookie, newCookie)
+	registry.RemoveIKE(oldCookie)
+	if registry.Count() != 1 || session.revoked.Load() || session.ikeCookie != newCookie {
+		t.Fatalf("count=%d revoked=%v cookie=%x", registry.Count(), session.revoked.Load(), session.ikeCookie)
+	}
+	registry.RemoveIKE(newCookie)
+	if registry.Count() != 0 || !session.revoked.Load() {
+		t.Fatalf("count=%d revoked=%v", registry.Count(), session.revoked.Load())
+	}
+}
+
 func TestESPBridgeMovesFlowToReplacementSAAfterDelete(t *testing.T) {
 	peer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 4500}
 	logicalPeer := &net.UDPAddr{IP: peer.IP, Port: 40000}

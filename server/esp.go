@@ -117,6 +117,34 @@ func (r *ESPRegistry) RemoveIKE(cookie isakmp.Cookie) {
 	r.mu.Unlock()
 }
 
+// RebindIKE transfers live child SAs to a replacement IKE SA without
+// recreating their crypto state or disturbing flows that reference them.
+func (r *ESPRegistry) RebindIKE(from, to isakmp.Cookie) {
+	if from == to || from == (isakmp.Cookie{}) || to == (isakmp.Cookie{}) {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sessions := r.byIKE[from]
+	if len(sessions) == 0 {
+		return
+	}
+	if r.byIKE[to] == nil {
+		r.byIKE[to] = make(map[*espSession]struct{})
+	}
+	latest := r.latest[from]
+	for session := range sessions {
+		delete(sessions, session)
+		session.ikeCookie = to
+		r.byIKE[to][session] = struct{}{}
+	}
+	delete(r.byIKE, from)
+	delete(r.latest, from)
+	if latest != nil && !latest.revoked.Load() {
+		r.latest[to] = latest
+	}
+}
+
 func (r *ESPRegistry) Close() {
 	r.mu.Lock()
 	for _, session := range r.inbound {

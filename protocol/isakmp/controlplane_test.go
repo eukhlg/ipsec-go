@@ -64,6 +64,92 @@ func TestControlPlaneHonorsNegotiatedPhase1Lifetime(t *testing.T) {
 	}
 }
 
+func TestEstablishedPhase1LifetimeIsSoft(t *testing.T) {
+	cookie := Cookie{1}
+	now := time.Unix(100, 0)
+	sa := &controlSA{
+		main:      &MainModeResponder{state: MainModeEstablished},
+		quick:     make(map[uint32]*QuickModeResponder),
+		expires:   now.Add(-time.Second),
+		updated:   now.Add(-time.Hour),
+		peerAddr:  &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 500},
+		responses: make(map[string][]byte),
+	}
+	control := &ControlPlane{config: ControlPlaneConfig{HandshakeTimeout: time.Minute}, sas: map[Cookie]*controlSA{cookie: sa}}
+
+	events := control.Maintain(now)
+	if len(events) != 0 || control.SACount() != 1 || !sa.softExpired {
+		t.Fatalf("events=%#v SAs=%d softExpired=%v", events, control.SACount(), sa.softExpired)
+	}
+}
+
+func TestPhase1ReplacementTransfersChildWithoutImmediateRekey(t *testing.T) {
+	now := time.Unix(100, 0)
+	oldCookie := Cookie{1}
+	newCookie := Cookie{2}
+	peerIP := netip.MustParseAddr("198.51.100.20")
+	identity := Identification{IDType: IDIPv4Address, Data: []byte{10, 0, 0, 20}}
+	pair := ESPPair{
+		Transform:       ESPTransform{Encryption: TransformESPAES, Authentication: ESPAuthHMACSHA196, Encapsulation: EncapsulationTransport, KeyBits: 128, LifetimeSeconds: 3600},
+		ResponderCookie: oldCookie,
+		Inbound:         ESPDirectionalKeys{SPI: 1, EncryptionKey: []byte{1}, AuthenticationKey: []byte{2}},
+		Outbound:        ESPDirectionalKeys{SPI: 2, EncryptionKey: []byte{3}, AuthenticationKey: []byte{4}},
+	}
+	oldSA := &controlSA{
+		peerIP:      peerIP,
+		main:        &MainModeResponder{state: MainModeEstablished, peerIdentity: identity},
+		quick:       make(map[uint32]*QuickModeResponder),
+		activePair:  clonePair(pair),
+		nextRekey:   now.Add(30 * time.Minute),
+		established: now.Add(-time.Hour),
+	}
+	newSA := &controlSA{
+		peerIP:         peerIP,
+		peerAddr:       &net.UDPAddr{IP: net.IPv4(198, 51, 100, 20), Port: 500},
+		main:           &MainModeResponder{state: MainModeEstablished, peerIdentity: identity, initiatorCookie: Cookie{3}, responderCookie: newCookie},
+		quick:          make(map[uint32]*QuickModeResponder),
+		quickInitiated: make(map[uint32]*QuickModeInitiator),
+		established:    now,
+	}
+	control := &ControlPlane{sas: map[Cookie]*controlSA{oldCookie: oldSA, newCookie: newSA}}
+
+	events := control.adoptPhase1Replacement(newCookie, newSA)
+	if oldSA.successor != newCookie || len(newSA.predecessors) != 1 || newSA.predecessors[0] != oldCookie {
+		t.Fatalf("successor=%x predecessors=%x", oldSA.successor, newSA.predecessors)
+	}
+	if len(events) != 1 || events[0].Type != LifecycleRebindIKE || events[0].ResponderCookie != oldCookie || events[0].ReplacementCookie != newCookie {
+		t.Fatalf("events=%#v", events)
+	}
+	if !newSA.nextRekey.Equal(oldSA.nextRekey) || newSA.activePair.Transform.Encryption == 0 || newSA.activePair.ResponderCookie != newCookie || newSA.activePair.InitiatorCookie != (Cookie{3}) {
+		t.Fatalf("nextRekey=%v activePair=%#v", newSA.nextRekey, newSA.activePair)
+	}
+	if datagrams := control.PollRekey(now); len(datagrams) != 0 {
+		t.Fatalf("immediate rekey datagrams=%d", len(datagrams))
+	}
+	if events := control.closeControlSA(oldCookie); len(events) != 0 {
+		t.Fatalf("predecessor close events=%#v", events)
+	}
+	if control.sas[oldCookie] != nil || control.sas[newCookie] != newSA || len(newSA.predecessors) != 0 {
+		t.Fatalf("SAs=%#v predecessors=%x", control.sas, newSA.predecessors)
+	}
+}
+
+func TestFailedPhase1ReplacementRestoresPredecessor(t *testing.T) {
+	oldCookie := Cookie{1}
+	newCookie := Cookie{2}
+	oldSA := &controlSA{main: &MainModeResponder{state: MainModeEstablished}, quick: make(map[uint32]*QuickModeResponder), successor: newCookie}
+	newSA := &controlSA{main: &MainModeResponder{state: MainModeFailed}, quick: make(map[uint32]*QuickModeResponder), predecessors: []Cookie{oldCookie}, activePair: ESPPair{Transform: ESPTransform{Encryption: TransformESPAES}}}
+	control := &ControlPlane{sas: map[Cookie]*controlSA{oldCookie: oldSA, newCookie: newSA}}
+
+	events := control.closeControlSA(newCookie)
+	if len(events) != 1 || events[0].Type != LifecycleRebindIKE || events[0].ResponderCookie != newCookie || events[0].ReplacementCookie != oldCookie {
+		t.Fatalf("events=%#v", events)
+	}
+	if oldSA.successor != (Cookie{}) || control.sas[oldCookie] != oldSA || control.sas[newCookie] != nil {
+		t.Fatalf("successor=%x SAs=%#v", oldSA.successor, control.sas)
+	}
+}
+
 func TestControlSAResponseCacheIsBounded(t *testing.T) {
 	sa := &controlSA{responses: make(map[string][]byte)}
 	for i := byte(0); i < 10; i++ {
