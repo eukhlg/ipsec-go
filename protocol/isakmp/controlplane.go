@@ -84,9 +84,13 @@ type controlSA struct {
 	dpdFailures    int
 	activePair     ESPPair
 	nextRekey      time.Time
+	rekeyFailures  int
+	rekeyRetryAt   time.Time
 	predecessors   []Cookie
 	successor      Cookie
 }
+
+const maxProactiveRekeyAttempts = 3
 
 type ControlPlane struct {
 	mu      sync.Mutex
@@ -239,6 +243,7 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 			if initiateErr != nil {
 				delete(sa.quickInitiated, packet.MessageID)
 				delete(sa.quickUpdated, packet.MessageID)
+				c.noteProactiveRekeyFailure(packet.ResponderCookie, sa, now)
 				return ControlPlaneResult{}, initiateErr
 			}
 			delete(sa.quickInitiated, packet.MessageID)
@@ -435,7 +440,7 @@ func (c *ControlPlane) PollRekey(now time.Time) []ControlDatagram {
 	defer c.mu.Unlock()
 	var datagrams []ControlDatagram
 	for cookie, sa := range c.sas {
-		if sa.main.State() != MainModeEstablished || !isZeroCookie(sa.successor) || sa.peerAddr == nil || sa.activePair.Transform.Encryption == 0 || sa.nextRekey.IsZero() || now.Before(sa.nextRekey) || len(sa.quickInitiated) != 0 {
+		if sa.main.State() != MainModeEstablished || !isZeroCookie(sa.successor) || sa.peerAddr == nil || sa.activePair.Transform.Encryption == 0 || sa.nextRekey.IsZero() || now.Before(sa.nextRekey) || (!sa.rekeyRetryAt.IsZero() && now.Before(sa.rekeyRetryAt)) || sa.rekeyFailures >= maxProactiveRekeyAttempts || len(sa.quickInitiated) != 0 {
 			continue
 		}
 		messageID, err := c.newMessageID(0)
@@ -454,7 +459,7 @@ func (c *ControlPlane) PollRekey(now time.Time) []ControlDatagram {
 		sa.quickInitiated[messageID] = quick
 		sa.quickUpdated[messageID] = now
 		datagrams = append(datagrams, ControlDatagram{Peer: cloneNetAddr(sa.peerAddr), Payload: wire, NATT: sa.natt})
-		c.debug("quick proactive tx peer=%s responder_cookie=%x message_id=%08x", sa.peerAddr, cookie, messageID)
+		c.debug("quick proactive tx peer=%s responder_cookie=%x message_id=%08x attempt=%d/%d", sa.peerAddr, cookie, messageID, sa.rekeyFailures+1, maxProactiveRekeyAttempts)
 	}
 	return datagrams
 }
@@ -493,8 +498,7 @@ func (c *ControlPlane) expire(now time.Time) {
 				sa.quickInitiated[messageID].Close()
 				delete(sa.quickInitiated, messageID)
 				delete(sa.quickUpdated, messageID)
-				// Retry on the next maintenance tick while the current child SA is usable.
-				sa.nextRekey = now
+				c.noteProactiveRekeyFailure(cookie, sa, now)
 			}
 		}
 		established := sa.main.State() == MainModeEstablished
@@ -560,6 +564,8 @@ func (sa *controlSA) cacheResponse(request, reply []byte) {
 func (sa *controlSA) recordPair(pair ESPPair, now time.Time) {
 	sa.clearPair()
 	sa.activePair = clonePair(pair)
+	sa.rekeyFailures = 0
+	sa.rekeyRetryAt = time.Time{}
 	lifetime := time.Duration(pair.Transform.LifetimeSeconds) * time.Second
 	if lifetime <= 0 {
 		return
@@ -569,6 +575,26 @@ func (sa *controlSA) recordPair(pair ESPPair, now time.Time) {
 		lead = time.Second
 	}
 	sa.nextRekey = now.Add(lifetime - lead)
+}
+
+func proactiveRekeyBackoff(failures int) time.Duration {
+	delay := 30 * time.Second
+	for i := 1; i < failures; i++ {
+		delay *= 2
+	}
+	return delay
+}
+
+func (c *ControlPlane) noteProactiveRekeyFailure(cookie Cookie, sa *controlSA, now time.Time) {
+	sa.rekeyFailures++
+	if sa.rekeyFailures >= maxProactiveRekeyAttempts {
+		sa.rekeyRetryAt = time.Time{}
+		c.debug("quick proactive suppressed peer=%s responder_cookie=%x failures=%d; awaiting peer-initiated rekey", sa.peerAddr, cookie, sa.rekeyFailures)
+		return
+	}
+	delay := proactiveRekeyBackoff(sa.rekeyFailures)
+	sa.rekeyRetryAt = now.Add(delay)
+	c.debug("quick proactive failed peer=%s responder_cookie=%x failures=%d retry_in=%s", sa.peerAddr, cookie, sa.rekeyFailures, delay)
 }
 
 func (sa *controlSA) clearPair() {
@@ -648,6 +674,8 @@ func (c *ControlPlane) adoptPhase1Replacement(cookie Cookie, replacement *contro
 		replacement.activePair.InitiatorCookie = initiatorCookie
 		replacement.activePair.ResponderCookie = cookie
 		replacement.nextRekey = newest.nextRekey
+		replacement.rekeyFailures = newest.rekeyFailures
+		replacement.rekeyRetryAt = newest.rekeyRetryAt
 	}
 	c.debug("ike phase1 replacement established peer=%s predecessor_cookie=%x replacement_cookie=%x predecessors=%d", replacement.peerAddr, newestCookie, cookie, len(replacement.predecessors))
 	if newest.activePair.Transform.Encryption == 0 {

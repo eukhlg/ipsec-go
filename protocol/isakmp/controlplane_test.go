@@ -150,6 +150,73 @@ func TestFailedPhase1ReplacementRestoresPredecessor(t *testing.T) {
 	}
 }
 
+func TestProactiveQuickModeUsesBoundedBackoffAndResetsOnPeerRekey(t *testing.T) {
+	now := time.Unix(100, 0)
+	main := testEstablishedMain(t)
+	cookie := main.responderCookie
+	pair := ESPPair{
+		Transform:       ESPTransform{Encryption: TransformESPAES, Authentication: ESPAuthHMACSHA196, Encapsulation: EncapsulationTransport, KeyBits: 128, LifetimeSeconds: 3600},
+		InitiatorCookie: main.initiatorCookie,
+		ResponderCookie: cookie,
+		Inbound:         ESPDirectionalKeys{SPI: 1, EncryptionKey: bytes.Repeat([]byte{1}, 16), AuthenticationKey: bytes.Repeat([]byte{2}, 20)},
+		Outbound:        ESPDirectionalKeys{SPI: 2, EncryptionKey: bytes.Repeat([]byte{3}, 16), AuthenticationKey: bytes.Repeat([]byte{4}, 20)},
+	}
+	sa := &controlSA{
+		peerAddr:       &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 500},
+		main:           main,
+		quick:          make(map[uint32]*QuickModeResponder),
+		quickInitiated: make(map[uint32]*QuickModeInitiator),
+		quickUpdated:   make(map[uint32]time.Time),
+		activePair:     clonePair(pair),
+		nextRekey:      now,
+		expires:        now.Add(time.Hour),
+	}
+	control := &ControlPlane{
+		config: ControlPlaneConfig{Random: bytes.NewReader(bytes.Repeat([]byte{0x61}, 8192)), QuickModeTimeout: 10 * time.Second},
+		sas:    map[Cookie]*controlSA{cookie: sa},
+	}
+
+	if got := control.PollRekey(now); len(got) != 1 {
+		t.Fatalf("first attempt=%d", len(got))
+	}
+	_ = control.Maintain(now.Add(10 * time.Second))
+	if sa.rekeyFailures != 1 || !sa.rekeyRetryAt.Equal(now.Add(40*time.Second)) {
+		t.Fatalf("first failure=%d retry=%v", sa.rekeyFailures, sa.rekeyRetryAt)
+	}
+	if got := control.PollRekey(now.Add(39 * time.Second)); len(got) != 0 {
+		t.Fatalf("attempt during first backoff=%d", len(got))
+	}
+	if got := control.PollRekey(now.Add(40 * time.Second)); len(got) != 1 {
+		t.Fatalf("second attempt=%d", len(got))
+	}
+	_ = control.Maintain(now.Add(50 * time.Second))
+	if sa.rekeyFailures != 2 || !sa.rekeyRetryAt.Equal(now.Add(110*time.Second)) {
+		t.Fatalf("second failure=%d retry=%v", sa.rekeyFailures, sa.rekeyRetryAt)
+	}
+	if got := control.PollRekey(now.Add(109 * time.Second)); len(got) != 0 {
+		t.Fatalf("attempt during second backoff=%d", len(got))
+	}
+	if got := control.PollRekey(now.Add(110 * time.Second)); len(got) != 1 {
+		t.Fatalf("third attempt=%d", len(got))
+	}
+	_ = control.Maintain(now.Add(120 * time.Second))
+	if sa.rekeyFailures != maxProactiveRekeyAttempts || !sa.rekeyRetryAt.IsZero() {
+		t.Fatalf("final failures=%d retry=%v", sa.rekeyFailures, sa.rekeyRetryAt)
+	}
+	if got := control.PollRekey(now.Add(24 * time.Hour)); len(got) != 0 {
+		t.Fatalf("attempt after suppression=%d", len(got))
+	}
+
+	sa.recordPair(pair, now.Add(121*time.Second))
+	if sa.rekeyFailures != 0 || !sa.rekeyRetryAt.IsZero() {
+		t.Fatalf("reset failures=%d retry=%v", sa.rekeyFailures, sa.rekeyRetryAt)
+	}
+	sa.nextRekey = now.Add(121 * time.Second)
+	if got := control.PollRekey(now.Add(121 * time.Second)); len(got) != 1 {
+		t.Fatalf("attempt after peer rekey=%d", len(got))
+	}
+}
+
 func TestControlSAResponseCacheIsBounded(t *testing.T) {
 	sa := &controlSA{responses: make(map[string][]byte)}
 	for i := byte(0); i < 10; i++ {
