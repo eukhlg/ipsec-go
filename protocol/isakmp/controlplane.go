@@ -64,30 +64,31 @@ type ControlDatagram struct {
 }
 
 type controlSA struct {
-	peer           string
-	peerIP         netip.Addr
-	peerAddr       net.Addr
-	natt           bool
-	main           *MainModeResponder
-	quick          map[uint32]*QuickModeResponder
-	quickInitiated map[uint32]*QuickModeInitiator
-	quickUpdated   map[uint32]time.Time
-	responses      map[string][]byte
-	responseOrder  []string
-	updated        time.Time
-	established    time.Time
-	expires        time.Time
-	softExpired    bool
-	nextDPD        time.Time
-	dpdSequence    uint32
-	dpdOutstanding bool
-	dpdFailures    int
-	activePair     ESPPair
-	nextRekey      time.Time
-	rekeyFailures  int
-	rekeyRetryAt   time.Time
-	predecessors   []Cookie
-	successor      Cookie
+	peer            string
+	peerIP          netip.Addr
+	peerAddr        net.Addr
+	natt            bool
+	main            *MainModeResponder
+	quick           map[uint32]*QuickModeResponder
+	quickInitiated  map[uint32]*QuickModeInitiator
+	quickUpdated    map[uint32]time.Time
+	responses       map[string][]byte
+	responseOrder   []string
+	updated         time.Time
+	established     time.Time
+	expires         time.Time
+	softExpired     bool
+	nextDPD         time.Time
+	dpdSequence     uint32
+	dpdOutstanding  bool
+	dpdFailures     int
+	activePair      ESPPair
+	pairEstablished time.Time
+	nextRekey       time.Time
+	rekeyFailures   int
+	rekeyRetryAt    time.Time
+	predecessors    []Cookie
+	successor       Cookie
 }
 
 const maxProactiveRekeyAttempts = 3
@@ -251,7 +252,7 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 			sa.recordPair(pair, now)
 			sa.cacheResponse(wire, reply)
 			sa.updated = now
-			c.debug("quick proactive established peer=%s message_id=%08x inbound_spi=%08x outbound_spi=%08x", peer, packet.MessageID, pair.Inbound.SPI, pair.Outbound.SPI)
+			c.debug("quick proactive established peer=%s origin=server message_id=%08x inbound_spi=%08x outbound_spi=%08x lifetime=%ds lifetime_kb=%d", peer, packet.MessageID, pair.Inbound.SPI, pair.Outbound.SPI, pair.Transform.LifetimeSeconds, pair.Transform.LifetimeKilobytes)
 			return ControlPlaneResult{Reply: reply, Established: &pair, Lifecycle: lifecycle}, nil
 		}
 		quick := sa.quick[packet.MessageID]
@@ -275,9 +276,14 @@ func (c *ControlPlane) handleDatagram(peer net.Addr, wire []byte, now time.Time,
 		if err == nil {
 			sa.quickUpdated[packet.MessageID] = now
 			if pair, ok := quick.Pair(); ok {
+				previousPairEstablished := sa.pairEstablished
 				established = &pair
 				sa.recordPair(pair, now)
-				c.debug("quick established peer=%s message_id=%08x inbound_spi=%08x outbound_spi=%08x encryption=%d key_bits=%d encapsulation=%d lifetime=%ds", peer, packet.MessageID, pair.Inbound.SPI, pair.Outbound.SPI, pair.Transform.Encryption, pair.Transform.KeyBits, pair.Transform.Encapsulation, pair.Transform.LifetimeSeconds)
+				sincePrevious := time.Duration(0)
+				if !previousPairEstablished.IsZero() {
+					sincePrevious = now.Sub(previousPairEstablished)
+				}
+				c.debug("quick established peer=%s origin=peer message_id=%08x inbound_spi=%08x outbound_spi=%08x encryption=%d key_bits=%d encapsulation=%d lifetime=%ds lifetime_kb=%d since_previous=%s", peer, packet.MessageID, pair.Inbound.SPI, pair.Outbound.SPI, pair.Transform.Encryption, pair.Transform.KeyBits, pair.Transform.Encapsulation, pair.Transform.LifetimeSeconds, pair.Transform.LifetimeKilobytes, sincePrevious)
 				quick.Close()
 				delete(sa.quick, packet.MessageID)
 				delete(sa.quickUpdated, packet.MessageID)
@@ -564,6 +570,7 @@ func (sa *controlSA) cacheResponse(request, reply []byte) {
 func (sa *controlSA) recordPair(pair ESPPair, now time.Time) {
 	sa.clearPair()
 	sa.activePair = clonePair(pair)
+	sa.pairEstablished = now
 	sa.rekeyFailures = 0
 	sa.rekeyRetryAt = time.Time{}
 	lifetime := time.Duration(pair.Transform.LifetimeSeconds) * time.Second
@@ -603,6 +610,7 @@ func (sa *controlSA) clearPair() {
 	zeroBytes(sa.activePair.Outbound.EncryptionKey)
 	zeroBytes(sa.activePair.Outbound.AuthenticationKey)
 	sa.activePair = ESPPair{}
+	sa.pairEstablished = time.Time{}
 }
 
 func (c *ControlPlane) closeControlSA(cookie Cookie) []LifecycleEvent {
@@ -673,6 +681,7 @@ func (c *ControlPlane) adoptPhase1Replacement(cookie Cookie, replacement *contro
 		initiatorCookie, _ := replacement.main.Cookies()
 		replacement.activePair.InitiatorCookie = initiatorCookie
 		replacement.activePair.ResponderCookie = cookie
+		replacement.pairEstablished = newest.pairEstablished
 		replacement.nextRekey = newest.nextRekey
 		replacement.rekeyFailures = newest.rekeyFailures
 		replacement.rekeyRetryAt = newest.rekeyRetryAt

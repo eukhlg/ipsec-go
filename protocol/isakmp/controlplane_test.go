@@ -96,12 +96,13 @@ func TestPhase1ReplacementTransfersChildWithoutImmediateRekey(t *testing.T) {
 		Outbound:        ESPDirectionalKeys{SPI: 2, EncryptionKey: []byte{3}, AuthenticationKey: []byte{4}},
 	}
 	oldSA := &controlSA{
-		peerIP:      peerIP,
-		main:        &MainModeResponder{state: MainModeEstablished, peerIdentity: identity},
-		quick:       make(map[uint32]*QuickModeResponder),
-		activePair:  clonePair(pair),
-		nextRekey:   now.Add(30 * time.Minute),
-		established: now.Add(-time.Hour),
+		peerIP:          peerIP,
+		main:            &MainModeResponder{state: MainModeEstablished, peerIdentity: identity},
+		quick:           make(map[uint32]*QuickModeResponder),
+		activePair:      clonePair(pair),
+		pairEstablished: now.Add(-20 * time.Minute),
+		nextRekey:       now.Add(30 * time.Minute),
+		established:     now.Add(-time.Hour),
 	}
 	newSA := &controlSA{
 		peerIP:         peerIP,
@@ -120,8 +121,8 @@ func TestPhase1ReplacementTransfersChildWithoutImmediateRekey(t *testing.T) {
 	if len(events) != 1 || events[0].Type != LifecycleRebindIKE || events[0].ResponderCookie != oldCookie || events[0].ReplacementCookie != newCookie {
 		t.Fatalf("events=%#v", events)
 	}
-	if !newSA.nextRekey.Equal(oldSA.nextRekey) || newSA.activePair.Transform.Encryption == 0 || newSA.activePair.ResponderCookie != newCookie || newSA.activePair.InitiatorCookie != (Cookie{3}) {
-		t.Fatalf("nextRekey=%v activePair=%#v", newSA.nextRekey, newSA.activePair)
+	if !newSA.nextRekey.Equal(oldSA.nextRekey) || !newSA.pairEstablished.Equal(oldSA.pairEstablished) || newSA.activePair.Transform.Encryption == 0 || newSA.activePair.ResponderCookie != newCookie || newSA.activePair.InitiatorCookie != (Cookie{3}) {
+		t.Fatalf("nextRekey=%v pairEstablished=%v activePair=%#v", newSA.nextRekey, newSA.pairEstablished, newSA.activePair)
 	}
 	if datagrams := control.PollRekey(now); len(datagrams) != 0 {
 		t.Fatalf("immediate rekey datagrams=%d", len(datagrams))
