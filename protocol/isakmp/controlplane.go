@@ -387,8 +387,27 @@ func (c *ControlPlane) handleInformational(sa *controlSA, responderCookie Cookie
 	return reply, events, err
 }
 
+// NotePeerActivity records authenticated traffic protected by a child SA owned
+// by cookie. Valid IPsec traffic proves that the peer is alive even when it
+// does not answer an outstanding DPD probe.
+func (c *ControlPlane) NotePeerActivity(cookie Cookie, now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sa := c.sas[cookie]
+	if sa == nil || sa.main.State() != MainModeEstablished {
+		return false
+	}
+	sa.updated = now
+	sa.dpdOutstanding, sa.dpdFailures = false, 0
+	if c.config.DPDInterval > 0 {
+		sa.nextDPD = now.Add(c.config.DPDInterval)
+	}
+	return true
+}
+
 // PollDPD creates proactive RFC 3706 probes and retires peers that miss three
-// consecutive intervals. Any authenticated IKE traffic clears the probe.
+// consecutive intervals. Any authenticated IKE or IPsec traffic clears the
+// probe.
 func (c *ControlPlane) PollDPD(now time.Time) []ControlDatagram {
 	c.mu.Lock()
 	defer c.mu.Unlock()

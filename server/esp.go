@@ -211,11 +211,12 @@ type espFlow struct {
 }
 
 type ESPBridge struct {
-	Engine   *Engine
-	Registry *ESPRegistry
-	mu       sync.RWMutex
-	flows    map[string]espFlow
-	Tracef   func(string, ...any)
+	Engine                *Engine
+	Registry              *ESPRegistry
+	mu                    sync.RWMutex
+	flows                 map[string]espFlow
+	authenticatedActivity func(isakmp.Cookie, time.Time)
+	Tracef                func(string, ...any)
 }
 
 func NewESPBridge(engine *Engine, registry *ESPRegistry) (*ESPBridge, error) {
@@ -223,6 +224,14 @@ func NewESPBridge(engine *Engine, registry *ESPRegistry) (*ESPBridge, error) {
 		return nil, errors.New("esp server: engine and registry are required")
 	}
 	return &ESPBridge{Engine: engine, Registry: registry, flows: make(map[string]espFlow)}, nil
+}
+
+// SetAuthenticatedActivityHandler registers a callback invoked after an ESP
+// packet has passed authentication and replay checks.
+func (b *ESPBridge) SetAuthenticatedActivityHandler(handler func(isakmp.Cookie, time.Time)) {
+	b.mu.Lock()
+	b.authenticatedActivity = handler
+	b.mu.Unlock()
 }
 
 // Handle receives a bare ESP packet (raw protocol 50 or the UDP/4500 payload),
@@ -238,6 +247,15 @@ func (b *ESPBridge) Handle(peer net.Addr, wire []byte, now time.Time) (ESPBridge
 			b.Registry.Remove(session.inboundSPI)
 		}
 		return ESPBridgeResult{}, err
+	}
+	b.Registry.mu.RLock()
+	ikeCookie := session.ikeCookie
+	b.Registry.mu.RUnlock()
+	b.mu.RLock()
+	authenticatedActivity := b.authenticatedActivity
+	b.mu.RUnlock()
+	if authenticatedActivity != nil && ikeCookie != (isakmp.Cookie{}) {
+		authenticatedActivity(ikeCookie, now)
 	}
 	if next != esp.IPProtocolUDP {
 		return ESPBridgeResult{}, ErrNotL2TP
