@@ -101,3 +101,31 @@ func TestControlPlaneProactiveDPDExpiresSilentPeer(t *testing.T) {
 		t.Fatalf("SAs=%d events=%#v", control.SACount(), events)
 	}
 }
+
+func TestControlPlaneAuthenticatedESPActivityClearsDPD(t *testing.T) {
+	main := testEstablishedMain(t)
+	main.capabilities.DPD = true
+	peer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 500}
+	now := time.Unix(100, 0)
+	sa := &controlSA{peer: addressKey(peer), peerAddr: peer, main: main, quick: make(map[uint32]*QuickModeResponder), quickUpdated: make(map[uint32]time.Time), responses: make(map[string][]byte), expires: now.Add(time.Hour)}
+	control := &ControlPlane{config: ControlPlaneConfig{Random: bytes.NewReader(bytes.Repeat([]byte{0x66}, 256)), DPDInterval: 20 * time.Second}, sas: map[Cookie]*controlSA{main.responderCookie: sa}}
+	if got := control.PollDPD(now); len(got) != 0 {
+		t.Fatalf("initial probes=%d", len(got))
+	}
+	if got := control.PollDPD(now.Add(20 * time.Second)); len(got) != 1 || !sa.dpdOutstanding {
+		t.Fatalf("probes=%d outstanding=%t", len(got), sa.dpdOutstanding)
+	}
+	activityAt := now.Add(30 * time.Second)
+	if !control.NotePeerActivity(main.responderCookie, activityAt) {
+		t.Fatal("authenticated ESP activity was not associated with the IKE SA")
+	}
+	if sa.dpdOutstanding || sa.dpdFailures != 0 || !sa.nextDPD.Equal(activityAt.Add(20*time.Second)) {
+		t.Fatalf("outstanding=%t failures=%d next=%s", sa.dpdOutstanding, sa.dpdFailures, sa.nextDPD)
+	}
+	if got := control.PollDPD(now.Add(40 * time.Second)); len(got) != 0 {
+		t.Fatalf("premature probes=%d", len(got))
+	}
+	if control.NotePeerActivity(Cookie{99}, activityAt) {
+		t.Fatal("unknown IKE SA accepted activity")
+	}
+}

@@ -18,6 +18,7 @@ func testESPPair(encapsulation uint16) isakmp.ESPPair {
 
 func TestESPBridgeProtectedL2TPHandshake(t *testing.T) {
 	pair := testESPPair(isakmp.EncapsulationTransport)
+	pair.ResponderCookie = isakmp.Cookie{9}
 	peer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 4500}
 	registry := NewESPRegistry()
 	if err := registry.Install(peer, pair); err != nil {
@@ -27,6 +28,13 @@ func TestESPBridgeProtectedL2TPHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var activityCount int
+	var activityCookie isakmp.Cookie
+	var activityAt time.Time
+	bridge.SetAuthenticatedActivityHandler(func(cookie isakmp.Cookie, now time.Time) {
+		activityCount++
+		activityCookie, activityAt = cookie, now
+	})
 	clientOutbound, err := esp.NewSA(esp.SAConfig{SPI: pair.Inbound.SPI, Transform: pair.Transform, EncryptionKey: pair.Inbound.EncryptionKey, AuthenticationKey: pair.Inbound.AuthenticationKey, Random: bytes.NewReader(bytes.Repeat([]byte{5}, 256))})
 	if err != nil {
 		t.Fatal(err)
@@ -46,6 +54,9 @@ func TestESPBridgeProtectedL2TPHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if activityCount != 1 || activityCookie != pair.ResponderCookie || !activityAt.Equal(time.Unix(1, 0)) {
+		t.Fatalf("activity count=%d cookie=%x at=%s", activityCount, activityCookie, activityAt)
+	}
 	if len(result.Datagrams) != 1 {
 		t.Fatalf("datagrams=%d", len(result.Datagrams))
 	}
@@ -63,6 +74,9 @@ func TestESPBridgeProtectedL2TPHandshake(t *testing.T) {
 	}
 	if _, err := bridge.Handle(peer, protected, time.Unix(2, 0)); err != esp.ErrReplay {
 		t.Fatalf("replay error=%v", err)
+	}
+	if activityCount != 1 {
+		t.Fatalf("replayed ESP refreshed activity: count=%d", activityCount)
 	}
 }
 
@@ -153,7 +167,7 @@ func TestESPBridgeMovesFlowToReplacementSAAfterDelete(t *testing.T) {
 	registry.mu.RLock()
 	oldSession := registry.bySPI[first.Inbound.SPI]
 	registry.mu.RUnlock()
-	bridge.flows[logicalPeer.String()] = espFlow{session: oldSession, peer: peer, clientPort: 40000}
+	bridge.flows[logicalPeer.String()] = espFlow{session: oldSession, peer: peer, logicalPeer: logicalPeer, clientPort: 40000}
 	if err := registry.Install(peer, second); err != nil {
 		t.Fatal(err)
 	}
@@ -165,5 +179,32 @@ func TestESPBridgeMovesFlowToReplacementSAAfterDelete(t *testing.T) {
 	}
 	if got := binary.BigEndian.Uint32(datagram.Payload[:4]); got != second.Outbound.SPI {
 		t.Fatalf("outbound SPI=%08x want=%08x", got, second.Outbound.SPI)
+	}
+}
+
+func TestESPBridgeCloseIKERemovesOwnedFlowsAndTunnels(t *testing.T) {
+	engine, _, logicalPeer, _ := establishTunnel(t)
+	peer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 4500}
+	cookie := isakmp.Cookie{9}
+	pair := testESPPair(isakmp.EncapsulationNATTTransport)
+	pair.ResponderCookie = cookie
+	registry := NewESPRegistry()
+	if err := registry.Install(peer, pair); err != nil {
+		t.Fatal(err)
+	}
+	bridge, err := NewESPBridge(engine, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry.mu.RLock()
+	session := registry.bySPI[pair.Inbound.SPI]
+	registry.mu.RUnlock()
+	bridge.flows[logicalPeer.String()] = espFlow{session: session, peer: peer, logicalPeer: logicalPeer, clientPort: 40000}
+
+	if closed := bridge.CloseIKE(isakmp.Cookie{8}); len(closed) != 0 || engine.TunnelCount() != 1 || len(bridge.flows) != 1 {
+		t.Fatalf("unrelated close: closed=%#v tunnels=%d flows=%d", closed, engine.TunnelCount(), len(bridge.flows))
+	}
+	if closed := bridge.CloseIKE(cookie); len(closed) != 0 || engine.TunnelCount() != 0 || len(bridge.flows) != 0 {
+		t.Fatalf("owned close: closed=%#v tunnels=%d flows=%d", closed, engine.TunnelCount(), len(bridge.flows))
 	}
 }

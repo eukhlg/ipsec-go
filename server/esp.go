@@ -193,6 +193,13 @@ func (r *ESPRegistry) replacement(session *espSession) *espSession {
 	}
 	return replacement
 }
+
+func (r *ESPRegistry) belongsToIKE(session *espSession, cookie isakmp.Cookie) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return session != nil && session.ikeCookie == cookie
+}
+
 func (r *ESPRegistry) Count() int { r.mu.RLock(); defer r.mu.RUnlock(); return len(r.inbound) }
 
 type ESPDatagram struct {
@@ -205,17 +212,19 @@ type ESPBridgeResult struct {
 	L2TP      Result
 }
 type espFlow struct {
-	session    *espSession
-	peer       net.Addr
-	clientPort uint16
+	session     *espSession
+	peer        net.Addr
+	logicalPeer net.Addr
+	clientPort  uint16
 }
 
 type ESPBridge struct {
-	Engine   *Engine
-	Registry *ESPRegistry
-	mu       sync.RWMutex
-	flows    map[string]espFlow
-	Tracef   func(string, ...any)
+	Engine                *Engine
+	Registry              *ESPRegistry
+	mu                    sync.RWMutex
+	flows                 map[string]espFlow
+	authenticatedActivity func(isakmp.Cookie, time.Time)
+	Tracef                func(string, ...any)
 }
 
 func NewESPBridge(engine *Engine, registry *ESPRegistry) (*ESPBridge, error) {
@@ -223,6 +232,36 @@ func NewESPBridge(engine *Engine, registry *ESPRegistry) (*ESPBridge, error) {
 		return nil, errors.New("esp server: engine and registry are required")
 	}
 	return &ESPBridge{Engine: engine, Registry: registry, flows: make(map[string]espFlow)}, nil
+}
+
+// SetAuthenticatedActivityHandler registers a callback invoked after an ESP
+// packet has passed authentication and replay checks.
+func (b *ESPBridge) SetAuthenticatedActivityHandler(handler func(isakmp.Cookie, time.Time)) {
+	b.mu.Lock()
+	b.authenticatedActivity = handler
+	b.mu.Unlock()
+}
+
+// CloseIKE removes protected L2TP flows owned by an expired IKE SA and closes
+// their local tunnels. The caller remains responsible for removing the ESP SAs
+// from the registry.
+func (b *ESPBridge) CloseIKE(cookie isakmp.Cookie) []SessionInfo {
+	b.mu.Lock()
+	peers := make(map[string]net.Addr)
+	for key, flow := range b.flows {
+		if b.Registry.belongsToIKE(flow.session, cookie) {
+			peers[key] = flow.logicalPeer
+			delete(b.flows, key)
+		}
+	}
+	b.mu.Unlock()
+	var closed []SessionInfo
+	for _, peer := range peers {
+		if peer != nil {
+			closed = append(closed, b.Engine.ClosePeer(peer)...)
+		}
+	}
+	return closed
 }
 
 // Handle receives a bare ESP packet (raw protocol 50 or the UDP/4500 payload),
@@ -238,6 +277,15 @@ func (b *ESPBridge) Handle(peer net.Addr, wire []byte, now time.Time) (ESPBridge
 			b.Registry.Remove(session.inboundSPI)
 		}
 		return ESPBridgeResult{}, err
+	}
+	b.Registry.mu.RLock()
+	ikeCookie := session.ikeCookie
+	b.Registry.mu.RUnlock()
+	b.mu.RLock()
+	authenticatedActivity := b.authenticatedActivity
+	b.mu.RUnlock()
+	if authenticatedActivity != nil && ikeCookie != (isakmp.Cookie{}) {
+		authenticatedActivity(ikeCookie, now)
 	}
 	if next != esp.IPProtocolUDP {
 		return ESPBridgeResult{}, ErrNotL2TP
@@ -255,7 +303,7 @@ func (b *ESPBridge) Handle(peer net.Addr, wire []byte, now time.Time) (ESPBridge
 		return ESPBridgeResult{}, err
 	}
 	b.mu.Lock()
-	b.flows[logicalPeer.String()] = espFlow{session: session, peer: peer, clientPort: sourcePort}
+	b.flows[logicalPeer.String()] = espFlow{session: session, peer: peer, logicalPeer: logicalPeer, clientPort: sourcePort}
 	b.mu.Unlock()
 	out := ESPBridgeResult{L2TP: result}
 	for _, reply := range result.Replies {
