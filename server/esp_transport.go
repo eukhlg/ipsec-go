@@ -169,7 +169,6 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 				return err
 			}
 		}
-
 	}
 }
 func (s *ESPTransportServer) debug(format string, args ...any) {

@@ -63,7 +63,7 @@ func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	session := &Association{owner: r, peerIP: append(net.IP(nil), ip...), peer: peer, inbound: inbound, outbound: outbound, encapsulation: pair.Transform.Encapsulation, inboundSPI: pair.Inbound.SPI, outboundSPI: pair.Outbound.SPI, ikeCookie: pair.ResponderCookie}
+	session := &Association{owner: r, peerIP: append(net.IP(nil), ip...), peer: clonePeer(peer), inbound: inbound, outbound: outbound, encapsulation: pair.Transform.Encapsulation, inboundSPI: pair.Inbound.SPI, outboundSPI: pair.Outbound.SPI, ikeCookie: pair.ResponderCookie}
 	if old := r.bySPI[pair.Inbound.SPI]; old != nil {
 		r.removeLocked(old)
 	}
@@ -180,7 +180,7 @@ func (r *ESPRegistry) removeLocked(session *Association) {
 	}
 }
 
-// replacement returns the newest live child SA belonging to the same IKE SA.
+// Replacement returns the newest live child SA belonging to the same IKE SA.
 // Quick Mode rekeying deliberately overlaps the old and new child SAs, so an
 // L2TP flow may still point at the old SA when the peer deletes it.
 func (r *ESPRegistry) Replacement(session *Association) *Association {
@@ -246,21 +246,48 @@ func (r *ESPRegistry) Seal(session *Association, peer net.Addr, payload []byte, 
 func (r *ESPRegistry) Cookie(session *Association) isakmp.Cookie {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if session == nil {
+	if session == nil || session.owner != r {
 		return isakmp.Cookie{}
 	}
 	return session.ikeCookie
 }
 func (s *Association) PeerIP() net.IP        { return append(net.IP(nil), s.peerIP...) }
-func (s *Association) Peer() net.Addr        { return s.peer }
+func (s *Association) Peer() net.Addr        { return clonePeer(s.peer) }
 func (s *Association) InboundSPI() uint32    { return s.inboundSPI }
 func (s *Association) Encapsulation() uint16 { return s.encapsulation }
 
-func addressIP(peer net.Addr) net.IP {
+// clonePeer keeps mutable standard-library address values outside the registry.
+func clonePeer(peer net.Addr) net.Addr {
 	switch value := peer.(type) {
 	case *net.UDPAddr:
+		if value == nil {
+			return nil
+		}
+		return &net.UDPAddr{IP: append(net.IP(nil), value.IP...), Port: value.Port, Zone: value.Zone}
+	case *net.IPAddr:
+		if value == nil {
+			return nil
+		}
+		return &net.IPAddr{IP: append(net.IP(nil), value.IP...), Zone: value.Zone}
+	default:
+		return peer
+	}
+}
+
+func addressIP(peer net.Addr) net.IP {
+	if peer == nil {
+		return nil
+	}
+	switch value := peer.(type) {
+	case *net.UDPAddr:
+		if value == nil {
+			return nil
+		}
 		return value.IP
 	case *net.IPAddr:
+		if value == nil {
+			return nil
+		}
 		return value.IP
 	}
 	host, _, err := net.SplitHostPort(peer.String())

@@ -128,3 +128,29 @@ func TestRegistryOpenSealWithoutL2TP(t *testing.T) {
 		t.Fatalf("revoked: %v", err)
 	}
 }
+
+func TestAssociationOwnsPeerAddress(t *testing.T) {
+	registry := NewESPRegistry()
+	peer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 4500}
+	pair := testESPPair(isakmp.EncapsulationNATTTransport)
+	pair.ResponderCookie = isakmp.Cookie{9}
+	if err := registry.Install(peer, pair); err != nil {
+		t.Fatal(err)
+	}
+	registry.mu.RLock()
+	association := registry.bySPI[pair.Inbound.SPI]
+	registry.mu.RUnlock()
+	peer.Port = 9999
+	peer.IP[0] ^= 0xff
+	returned := association.Peer().(*net.UDPAddr)
+	if returned.Port != 4500 || !returned.IP.Equal(net.IPv4(192, 0, 2, 10)) {
+		t.Fatalf("borrowed peer address: %v", returned)
+	}
+	returned.Port = 8888
+	if association.Peer().(*net.UDPAddr).Port != 4500 {
+		t.Fatal("mutable exported peer address")
+	}
+	if NewESPRegistry().Cookie(association) != (isakmp.Cookie{}) {
+		t.Fatal("foreign registry exposed cookie")
+	}
+}
