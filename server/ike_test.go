@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/eukhlg/l2tp-go/protocol/isakmp"
+	"github.com/eukhlg/ipsec-go/protocol/isakmp"
 )
 
 func TestIKEServerSurvivesMalformedDatagramAndReplies(t *testing.T) {
@@ -54,5 +54,17 @@ func TestIKEServerSurvivesMalformedDatagramAndReplies(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("server did not stop")
+	}
+}
+
+func TestInjectedConstructorsRejectMissingDependencies(t *testing.T) {
+	if _, err := NewIKEServer(nil, nil); err == nil {
+		t.Fatal("IKE server accepted missing dependencies")
+	}
+	if _, err := NewNATTServer(nil, nil, nil); err == nil {
+		t.Fatal("NAT-T server accepted missing dependencies")
+	}
+	if _, err := NewRawESPServer(nil, nil); err == nil {
+		t.Fatal("raw ESP server accepted missing dependencies")
 	}
 }

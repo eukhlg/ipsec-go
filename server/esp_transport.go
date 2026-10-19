@@ -6,48 +6,53 @@ import (
 	"net"
 	"time"
 
-	"github.com/eukhlg/l2tp-go/protocol/esp"
-	"github.com/eukhlg/l2tp-go/protocol/isakmp"
+	"github.com/eukhlg/ipsec-go/protocol/esp"
+	"github.com/eukhlg/ipsec-go/protocol/isakmp"
 )
 
-type ESPResultHandler func(context.Context, ESPBridgeResult) error
+// ESPPacketResult separates protocol replies from application event dispatch.
+// Dispatch runs only after replies have been written successfully.
+type ESPPacketResult struct {
+	Datagrams []ESPDatagram
+	Dispatch  func(context.Context) error
+}
+type ESPPacketHandler func(context.Context, net.Addr, []byte, time.Time) (ESPPacketResult, error)
 
 type ESPTransportServer struct {
 	Conn         net.PacketConn
-	Bridge       *ESPBridge
+	HandlePacket ESPPacketHandler
 	ControlPlane *isakmp.ControlPlane
 	NATT         bool
-	HandleResult ESPResultHandler
 	Established  IKEEstablishedHandler
 	Lifecycle    IKELifecycleHandler
 	Debugf       func(string, ...any)
 	Tracef       func(string, ...any)
 }
 
-func ListenRawESP(address string, bridge *ESPBridge) (*ESPTransportServer, error) {
+func ListenRawESP(address string, handler ESPPacketHandler) (*ESPTransportServer, error) {
 	conn, err := net.ListenPacket("ip4:50", address)
 	if err != nil {
 		return nil, err
 	}
-	server, err := NewRawESPServer(conn, bridge)
+	server, err := NewRawESPServer(conn, handler)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
 	return server, nil
 }
-func ListenNATT(address string, bridge *ESPBridge) (*ESPTransportServer, error) {
-	return ListenNATTWithIKE(address, bridge, nil)
+func ListenNATT(address string, handler ESPPacketHandler) (*ESPTransportServer, error) {
+	return ListenNATTWithIKE(address, handler, nil)
 }
 
 // ListenNATTWithIKE binds the shared RFC 3948 UDP/4500 socket. IKE packets
 // carry the Non-ESP Marker; all other sufficiently large datagrams are ESP.
-func ListenNATTWithIKE(address string, bridge *ESPBridge, control *isakmp.ControlPlane) (*ESPTransportServer, error) {
+func ListenNATTWithIKE(address string, handler ESPPacketHandler, control *isakmp.ControlPlane) (*ESPTransportServer, error) {
 	conn, err := net.ListenPacket("udp", address)
 	if err != nil {
 		return nil, err
 	}
-	server, err := NewNATTServer(conn, bridge, control)
+	server, err := NewNATTServer(conn, handler, control)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -56,25 +61,25 @@ func ListenNATTWithIKE(address string, bridge *ESPBridge, control *isakmp.Contro
 }
 
 // NewRawESPServer creates a raw ESP transport over an injected connection.
-func NewRawESPServer(conn net.PacketConn, bridge *ESPBridge) (*ESPTransportServer, error) {
-	if conn == nil || bridge == nil {
-		return nil, errors.New("esp server: packet connection and bridge are required")
+func NewRawESPServer(conn net.PacketConn, handler ESPPacketHandler) (*ESPTransportServer, error) {
+	if conn == nil || handler == nil {
+		return nil, errors.New("esp server: packet connection and handler are required")
 	}
-	return &ESPTransportServer{Conn: conn, Bridge: bridge}, nil
+	return &ESPTransportServer{Conn: conn, HandlePacket: handler}, nil
 }
 
 // NewNATTServer creates a UDP/4500 ESP transport over an injected connection.
 // control may be nil when IKE demultiplexing is handled by the embedder.
-func NewNATTServer(conn net.PacketConn, bridge *ESPBridge, control *isakmp.ControlPlane) (*ESPTransportServer, error) {
-	if conn == nil || bridge == nil {
-		return nil, errors.New("esp server: packet connection and bridge are required")
+func NewNATTServer(conn net.PacketConn, handler ESPPacketHandler, control *isakmp.ControlPlane) (*ESPTransportServer, error) {
+	if conn == nil || handler == nil {
+		return nil, errors.New("esp server: packet connection and handler are required")
 	}
-	return &ESPTransportServer{Conn: conn, Bridge: bridge, ControlPlane: control, NATT: true}, nil
+	return &ESPTransportServer{Conn: conn, HandlePacket: handler, ControlPlane: control, NATT: true}, nil
 }
 
 func (s *ESPTransportServer) Serve(ctx context.Context) error {
-	if s.Conn == nil || s.Bridge == nil {
-		return errors.New("esp transport server: missing connection or bridge")
+	if s.Conn == nil || s.HandlePacket == nil {
+		return errors.New("esp transport server: missing connection or handler")
 	}
 	buffer := make([]byte, 65535)
 	for {
@@ -142,7 +147,7 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 				continue
 			}
 		}
-		result, err := s.Bridge.Handle(peer, wire, time.Now())
+		result, err := s.HandlePacket(ctx, peer, wire, time.Now())
 		if err != nil {
 			s.debug("esp drop peer=%s natt=%t bytes=%d error=%v", peer, s.NATT, len(wire), err)
 			continue
@@ -159,11 +164,12 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 				return err
 			}
 		}
-		if s.HandleResult != nil {
-			if err := s.HandleResult(ctx, result); err != nil {
+		if result.Dispatch != nil {
+			if err := result.Dispatch(ctx); err != nil {
 				return err
 			}
 		}
+
 	}
 }
 func (s *ESPTransportServer) debug(format string, args ...any) {

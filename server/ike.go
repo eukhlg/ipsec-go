@@ -6,7 +6,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/eukhlg/l2tp-go/protocol/isakmp"
+	"github.com/eukhlg/ipsec-go/protocol/isakmp"
 )
 
 type IKEEstablishedHandler func(context.Context, net.Addr, isakmp.ESPPair)
