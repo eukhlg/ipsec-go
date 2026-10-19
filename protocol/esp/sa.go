@@ -85,28 +85,30 @@ func (s *SA) Seal(payload []byte, nextHeader uint8) ([]byte, error) {
 	if padLength == s.block.BlockSize() {
 		padLength = 0
 	}
-	plain := make([]byte, len(payload)+padLength+2)
+	// Assemble the entire packet in its owned output buffer. The payload region
+	// starts as padded plaintext and is encrypted in place before authentication.
+	plainLength := len(payload) + padLength + 2
+	ivEnd := HeaderSize + s.block.BlockSize()
+	authEnd := ivEnd + plainLength
+	wire := make([]byte, authEnd+ICVSizeHMACSHA196)
+	binary.BigEndian.PutUint32(wire[:4], s.spi)
+	binary.BigEndian.PutUint32(wire[4:8], s.sequence)
+	iv := wire[HeaderSize:ivEnd]
+	if _, err := io.ReadFull(s.random, iv); err != nil {
+		s.sequence--
+		return nil, err
+	}
+	plain := wire[ivEnd:authEnd]
 	copy(plain, payload)
 	for i := 0; i < padLength; i++ {
 		plain[len(payload)+i] = byte(i + 1)
 	}
 	plain[len(plain)-2], plain[len(plain)-1] = byte(padLength), nextHeader
-	iv := make([]byte, s.block.BlockSize())
-	if _, err := io.ReadFull(s.random, iv); err != nil {
-		s.sequence--
-		return nil, err
-	}
-	ciphertext := make([]byte, len(plain))
-	cipher.NewCBCEncrypter(s.block, iv).CryptBlocks(ciphertext, plain)
-	authenticated := make([]byte, HeaderSize+len(iv)+len(ciphertext))
-	binary.BigEndian.PutUint32(authenticated[:4], s.spi)
-	binary.BigEndian.PutUint32(authenticated[4:8], s.sequence)
-	copy(authenticated[8:], iv)
-	copy(authenticated[8+len(iv):], ciphertext)
-	icv := calculateICV(s.authKey, authenticated)
+	cipher.NewCBCEncrypter(s.block, iv).CryptBlocks(plain, plain)
+	copy(wire[authEnd:], calculateICV(s.authKey, wire[:authEnd]))
 	s.packets++
 	s.bytes += uint64(len(payload))
-	return append(authenticated, icv...), nil
+	return wire, nil
 }
 
 func (s *SA) Open(wire []byte) ([]byte, uint8, error) {
