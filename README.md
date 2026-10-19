@@ -31,7 +31,8 @@ The implementation has not had an independent security audit. Existing
 interoperability results do not establish production security or scale.
 
 Run `GOWORK=off go test ./...` to test the library independently. Releases use
-`v`-prefixed semantic versions, starting with the planned v0.1.0 release.
+`v`-prefixed semantic versions, starting with
+[v0.1.0](https://github.com/eukhlg/ipsec-go/releases/tag/v0.1.0).
 
 The relevant history was extracted from the original combined l2tp-go project;
 Overture VPN retains the complete application history.
