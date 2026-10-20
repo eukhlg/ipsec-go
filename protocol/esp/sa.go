@@ -19,6 +19,8 @@ import (
 
 type Limits struct{ Packets, Bytes uint64 }
 type SAConfig struct {
+	// ReplayWindowSize is 64 by default, or a multiple of 64 up to 1024.
+	ReplayWindowSize                 uint32
 	SPI                              uint32
 	Transform                        isakmp.ESPTransform
 	EncryptionKey, AuthenticationKey []byte
@@ -66,7 +68,11 @@ func NewSA(config SAConfig) (*SA, error) {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
-	return &SA{spi: config.SPI, block: block, authKey: append([]byte(nil), config.AuthenticationKey...), random: config.Random, limits: config.Limits, lifetime: config.Lifetime, created: config.Now(), now: config.Now}, nil
+	replay, err := NewReplayWindow(config.ReplayWindowSize)
+	if err != nil {
+		return nil, err
+	}
+	return &SA{replay: replay, spi: config.SPI, block: block, authKey: append([]byte(nil), config.AuthenticationKey...), random: config.Random, limits: config.Limits, lifetime: config.Lifetime, created: config.Now(), now: config.Now}, nil
 }
 
 func (s *SA) SPI() uint32 { return s.spi }

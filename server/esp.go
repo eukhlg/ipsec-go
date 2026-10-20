@@ -32,6 +32,9 @@ type Association struct {
 	revoked                 atomic.Bool
 }
 
+// inboundReplayWindowSize tolerates burst reordering on fast VPN links.
+const inboundReplayWindowSize = 1024
+
 type ESPRegistry struct {
 	mu      sync.RWMutex
 	inbound map[uint32]*Association
@@ -54,7 +57,7 @@ func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
 	if pair.Transform.LifetimeKilobytes != 0 {
 		limits.Bytes = uint64(pair.Transform.LifetimeKilobytes) * 1024
 	}
-	inbound, err := esp.NewSA(esp.SAConfig{SPI: pair.Inbound.SPI, Transform: pair.Transform, EncryptionKey: pair.Inbound.EncryptionKey, AuthenticationKey: pair.Inbound.AuthenticationKey, Lifetime: lifetime, Limits: limits})
+	inbound, err := esp.NewSA(esp.SAConfig{ReplayWindowSize: inboundReplayWindowSize, SPI: pair.Inbound.SPI, Transform: pair.Transform, EncryptionKey: pair.Inbound.EncryptionKey, AuthenticationKey: pair.Inbound.AuthenticationKey, Lifetime: lifetime, Limits: limits})
 	if err != nil {
 		return err
 	}
