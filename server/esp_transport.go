@@ -6,6 +6,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/eukhlg/ipsec-go/packetbuf"
 	"github.com/eukhlg/ipsec-go/protocol/esp"
 	"github.com/eukhlg/ipsec-go/protocol/isakmp"
 )
@@ -21,12 +22,15 @@ type ESPPacketHandler func(context.Context, net.Addr, []byte, time.Time) (ESPPac
 type ESPTransportServer struct {
 	Conn         net.PacketConn
 	HandlePacket ESPPacketHandler
-	ControlPlane *isakmp.ControlPlane
-	NATT         bool
-	Established  IKEEstablishedHandler
-	Lifecycle    IKELifecycleHandler
-	Debugf       func(string, ...any)
-	Tracef       func(string, ...any)
+	// HandlePacketInPlace, when set, may mutate the owned receive buffer and
+	// borrow its data through Dispatch. It must not retain slices after Dispatch.
+	HandlePacketInPlace ESPPacketHandler
+	ControlPlane        *isakmp.ControlPlane
+	NATT                bool
+	Established         IKEEstablishedHandler
+	Lifecycle           IKELifecycleHandler
+	Debugf              func(string, ...any)
+	Tracef              func(string, ...any)
 }
 
 func ListenRawESP(address string, handler ESPPacketHandler) (*ESPTransportServer, error) {
@@ -78,11 +82,22 @@ func NewNATTServer(conn net.PacketConn, handler ESPPacketHandler, control *isakm
 }
 
 func (s *ESPTransportServer) Serve(ctx context.Context) error {
-	if s.Conn == nil || s.HandlePacket == nil {
+	if s.Conn == nil || (s.HandlePacket == nil && s.HandlePacketInPlace == nil) {
 		return errors.New("esp transport server: missing connection or handler")
 	}
-	buffer := make([]byte, 65535)
+	owned, err := packetbuf.Acquire(packetbuf.MaxPacket)
+	if err != nil {
+		return err
+	}
+	defer owned.Release()
+	buffer := owned.Bytes()
+	handler := s.HandlePacket
+	if s.HandlePacketInPlace != nil {
+		handler = s.HandlePacketInPlace
+	}
+	used := 0
 	for {
+		clear(buffer[:used]) // previous synchronous Dispatch has finished; erase plaintext
 		if err := s.Conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 			return err
 		}
@@ -102,7 +117,8 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 			}
 			return err
 		}
-		wire := buffer[:n]
+		used = n
+		wire := buffer[:n:n]
 		if s.NATT {
 			kind, payload := esp.ClassifyNATT(wire)
 			s.trace("natt udp/4500 rx peer=%s bytes=%d kind=%d", peer, n, kind)
@@ -147,27 +163,32 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 				continue
 			}
 		}
-		result, err := s.HandlePacket(ctx, peer, wire, time.Now())
+		result, err := handler(ctx, peer, wire, time.Now())
 		if err != nil {
 			s.debug("esp drop peer=%s natt=%t bytes=%d error=%v", peer, s.NATT, len(wire), err)
 			continue
 		}
-		for _, reply := range result.Datagrams {
-			if reply.NATT != s.NATT {
-				continue
+		if err := func() error {
+			defer func() {
+				for _, reply := range result.Datagrams {
+					reply.Release()
+				}
+			}()
+			for _, reply := range result.Datagrams {
+				if reply.NATT != s.NATT {
+					continue
+				}
+				// NAT-T ESP has no extra marker; write the same ciphertext directly.
+				if _, err := s.Conn.WriteTo(reply.Payload, reply.Peer); err != nil {
+					return err
+				}
 			}
-			payload := reply.Payload
-			if s.NATT {
-				payload = esp.EncapsulateNATTESP(payload)
+			if result.Dispatch != nil {
+				return result.Dispatch(ctx)
 			}
-			if _, err := s.Conn.WriteTo(payload, reply.Peer); err != nil {
-				return err
-			}
-		}
-		if result.Dispatch != nil {
-			if err := result.Dispatch(ctx); err != nil {
-				return err
-			}
+			return nil
+		}(); err != nil {
+			return err
 		}
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/eukhlg/ipsec-go/packetbuf"
 	"github.com/eukhlg/ipsec-go/protocol/isakmp"
 )
 
@@ -77,68 +78,97 @@ func NewSA(config SAConfig) (*SA, error) {
 
 func (s *SA) SPI() uint32 { return s.spi }
 
+// Seal preserves caller ownership. SealBuffer is the allocation-free payload path.
 func (s *SA) Seal(payload []byte, nextHeader uint8) ([]byte, error) {
+	b, err := packetbuf.Copy(payload)
+	if err != nil {
+		return nil, err
+	}
+	defer b.Release()
+	if err = s.SealBuffer(b, nextHeader); err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), b.Bytes()...), nil
+}
+
+// SealBuffer pads, encrypts and authenticates exclusively owned storage in place.
+// Ownership stays with the caller on both success and failure.
+func (s *SA) SealBuffer(b *packetbuf.Buffer, nextHeader uint8) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sequence == ^uint32(0) {
-		return nil, ErrSequenceExhausted
+		return ErrSequenceExhausted
 	}
-	if err := s.checkLifetime(uint64(len(payload))); err != nil {
-		return nil, err
+	size := b.Len()
+	if err := s.checkLifetime(uint64(size)); err != nil {
+		return err
 	}
+	blockSize := s.block.BlockSize()
+	padLength := (blockSize - (size+2)%blockSize) % blockSize
+	headerSize := HeaderSize + blockSize
+	tailSize := padLength + 2 + ICVSizeHMACSHA196
+	if size > packetbuf.MaxWire-headerSize-tailSize || b.Headroom() < headerSize || b.Tailroom() < tailSize {
+		return packetbuf.ErrSize
+	}
+	// Generate before mutating the packet or consuming sequence/lifetime state.
+	var randomIV [16]byte
+	if _, err := io.ReadFull(s.random, randomIV[:blockSize]); err != nil {
+		return err
+	}
+	header, _ := b.Prepend(headerSize)
+	tail, _ := b.Append(tailSize)
 	s.sequence++
-	padLength := s.block.BlockSize() - (len(payload)+2)%s.block.BlockSize()
-	if padLength == s.block.BlockSize() {
-		padLength = 0
-	}
-	// Assemble the entire packet in its owned output buffer. The payload region
-	// starts as padded plaintext and is encrypted in place before authentication.
-	plainLength := len(payload) + padLength + 2
-	ivEnd := HeaderSize + s.block.BlockSize()
-	authEnd := ivEnd + plainLength
-	wire := make([]byte, authEnd+ICVSizeHMACSHA196)
-	binary.BigEndian.PutUint32(wire[:4], s.spi)
-	binary.BigEndian.PutUint32(wire[4:8], s.sequence)
-	iv := wire[HeaderSize:ivEnd]
-	if _, err := io.ReadFull(s.random, iv); err != nil {
-		s.sequence--
-		return nil, err
-	}
-	plain := wire[ivEnd:authEnd]
-	copy(plain, payload)
+	binary.BigEndian.PutUint32(header[:4], s.spi)
+	binary.BigEndian.PutUint32(header[4:8], s.sequence)
+	copy(header[HeaderSize:], randomIV[:blockSize])
+	clear(randomIV[:])
 	for i := 0; i < padLength; i++ {
-		plain[len(payload)+i] = byte(i + 1)
+		tail[i] = byte(i + 1)
 	}
-	plain[len(plain)-2], plain[len(plain)-1] = byte(padLength), nextHeader
-	cipher.NewCBCEncrypter(s.block, iv).CryptBlocks(plain, plain)
+	tail[padLength], tail[padLength+1] = byte(padLength), nextHeader
+	wire := b.Bytes()
+	authEnd := len(wire) - ICVSizeHMACSHA196
+	plain := wire[headerSize:authEnd]
+	cipher.NewCBCEncrypter(s.block, header[HeaderSize:]).CryptBlocks(plain, plain)
 	copy(wire[authEnd:], calculateICV(s.authKey, wire[:authEnd]))
 	s.packets++
-	s.bytes += uint64(len(payload))
-	return wire, nil
+	s.bytes += uint64(size)
+	return nil
 }
 
+// Open preserves caller-owned ciphertext; OpenInPlace explicitly permits mutation.
 func (s *SA) Open(wire []byte) ([]byte, uint8, error) {
+	owned := append([]byte(nil), wire...)
+	payload, next, err := s.OpenInPlace(owned)
+	if err != nil {
+		clear(owned)
+		return nil, 0, err
+	}
+	return payload, next, nil
+}
+
+// OpenInPlace authenticates before decrypting. The returned bounded view aliases
+// wire and is valid only while its owner retains that storage. Failure may leave
+// decrypted bytes in wire; the owner must clear storage before pooling it.
+func (s *SA) OpenInPlace(wire []byte) ([]byte, uint8, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	packet, err := DecodePacket(wire, s.block.BlockSize(), ICVSizeHMACSHA196)
+	packet, err := DecodePacketView(wire, s.block.BlockSize(), ICVSizeHMACSHA196)
 	if err != nil {
 		return nil, 0, err
 	}
 	if packet.SPI != s.spi {
 		return nil, 0, ErrInvalidPacket
 	}
-	if err := s.replay.Check(packet.Sequence); err != nil {
+	if err = s.replay.Check(packet.Sequence); err != nil {
 		return nil, 0, err
 	}
 	want := calculateICV(s.authKey, wire[:len(wire)-ICVSizeHMACSHA196])
 	if subtle.ConstantTimeCompare(want, packet.ICV) != 1 {
 		return nil, 0, ErrAuthentication
 	}
-	plain := make([]byte, len(packet.Ciphertext))
-	cipher.NewCBCDecrypter(s.block, packet.IV).CryptBlocks(plain, packet.Ciphertext)
-	if len(plain) < 2 {
-		return nil, 0, ErrInvalidPacket
-	}
+	plain := packet.Ciphertext
+	cipher.NewCBCDecrypter(s.block, packet.IV).CryptBlocks(plain, plain)
 	padLength := int(plain[len(plain)-2])
 	if padLength+2 > len(plain) {
 		return nil, 0, ErrInvalidPacket
@@ -149,12 +179,12 @@ func (s *SA) Open(wire []byte) ([]byte, uint8, error) {
 			return nil, 0, ErrInvalidPacket
 		}
 	}
-	payload := append([]byte(nil), plain[:padStart]...)
+	payload := plain[:padStart:padStart]
 	next := plain[len(plain)-1]
-	if err := s.checkLifetime(uint64(len(payload))); err != nil {
+	if err = s.checkLifetime(uint64(len(payload))); err != nil {
 		return nil, 0, err
 	}
-	if err := s.replay.Accept(packet.Sequence); err != nil {
+	if err = s.replay.Accept(packet.Sequence); err != nil {
 		return nil, 0, err
 	}
 	s.packets++

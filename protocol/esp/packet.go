@@ -30,7 +30,19 @@ type Packet struct {
 }
 
 func DecodePacket(wire []byte, blockSize, icvSize int) (Packet, error) {
-	if blockSize <= 0 || icvSize <= 0 || len(wire) < HeaderSize+blockSize+blockSize+icvSize {
+	p, err := DecodePacketView(wire, blockSize, icvSize)
+	if err != nil {
+		return Packet{}, err
+	}
+	p.IV = append([]byte(nil), p.IV...)
+	p.Ciphertext = append([]byte(nil), p.Ciphertext...)
+	p.ICV = append([]byte(nil), p.ICV...)
+	return p, nil
+}
+
+// DecodePacketView returns bounded borrowed slices, valid for the wire lifetime.
+func DecodePacketView(wire []byte, blockSize, icvSize int) (Packet, error) {
+	if blockSize <= 0 || blockSize > 16 || icvSize <= 0 || icvSize > 64 || len(wire) < HeaderSize+blockSize+blockSize+icvSize {
 		return Packet{}, ErrShortPacket
 	}
 	payloadEnd := len(wire) - icvSize
@@ -41,9 +53,9 @@ func DecodePacket(wire []byte, blockSize, icvSize int) (Packet, error) {
 	if p.SPI == 0 || p.Sequence == 0 {
 		return Packet{}, fmt.Errorf("%w: zero SPI or sequence", ErrInvalidPacket)
 	}
-	p.IV = append([]byte(nil), wire[HeaderSize:HeaderSize+blockSize]...)
-	p.Ciphertext = append([]byte(nil), wire[HeaderSize+blockSize:payloadEnd]...)
-	p.ICV = append([]byte(nil), wire[payloadEnd:]...)
+	p.IV = wire[HeaderSize : HeaderSize+blockSize : HeaderSize+blockSize]
+	p.Ciphertext = wire[HeaderSize+blockSize : payloadEnd : payloadEnd]
+	p.ICV = wire[payloadEnd:len(wire):len(wire)]
 	return p, nil
 }
 
