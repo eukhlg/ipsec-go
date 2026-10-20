@@ -309,3 +309,16 @@ func (r *ESPRegistry) String() string { return fmt.Sprintf("ESPRegistry{%d}", r.
 func (s *Association) Active() bool {
 	return s != nil && s.owner != nil && !s.revoked.Load() && (s.expiresAt.IsZero() || time.Now().Before(s.expiresAt))
 }
+
+// ReplayState snapshots receive state for diagnostics after Open rejects a
+// packet. The snapshot may reflect subsequent traffic and is not authentication.
+func (r *ESPRegistry) ReplayState(peer net.Addr, wire []byte) (esp.ReplayState, bool) {
+	if len(wire) < 8 {
+		return esp.ReplayState{}, false
+	}
+	session, err := r.lookup(peer, wire)
+	if err != nil {
+		return esp.ReplayState{}, false
+	}
+	return session.inbound.ReplayState(binary.BigEndian.Uint32(wire[4:8])), true
+}
