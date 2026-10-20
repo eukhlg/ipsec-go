@@ -28,19 +28,47 @@ type Association struct {
 	encapsulation           uint16
 	inboundSPI, outboundSPI uint32
 	ikeCookie               isakmp.Cookie
+	expiresAt               time.Time
 	revoked                 atomic.Bool
 }
 
+// DefaultInboundReplayWindowSize tolerates burst reordering on fast VPN links.
+const DefaultInboundReplayWindowSize = 1024
+
+type ESPRegistryConfig struct {
+	// ReplayWindowSize is a multiple of 64 from 64 through 1024. Zero selects
+	// DefaultInboundReplayWindowSize. The value applies to all installed SAs.
+	ReplayWindowSize uint32
+}
+
 type ESPRegistry struct {
-	mu      sync.RWMutex
-	inbound map[uint32]*Association
-	bySPI   map[uint32]*Association
-	byIKE   map[isakmp.Cookie]map[*Association]struct{}
-	latest  map[isakmp.Cookie]*Association
+	replayWindowSize uint32
+	mu               sync.RWMutex
+	inbound          map[uint32]*Association
+	bySPI            map[uint32]*Association
+	byIKE            map[isakmp.Cookie]map[*Association]struct{}
+	latest           map[isakmp.Cookie]*Association
 }
 
 func NewESPRegistry() *ESPRegistry {
-	return &ESPRegistry{inbound: make(map[uint32]*Association), bySPI: make(map[uint32]*Association), byIKE: make(map[isakmp.Cookie]map[*Association]struct{}), latest: make(map[isakmp.Cookie]*Association)}
+	return newESPRegistry(DefaultInboundReplayWindowSize)
+}
+
+// NewESPRegistryWithConfig validates receiver policy before any SA is installed.
+// Configuration is immutable for the lifetime of the registry.
+func NewESPRegistryWithConfig(config ESPRegistryConfig) (*ESPRegistry, error) {
+	size := config.ReplayWindowSize
+	if size == 0 {
+		size = DefaultInboundReplayWindowSize
+	}
+	if _, err := esp.NewReplayWindow(size); err != nil {
+		return nil, fmt.Errorf("esp registry: invalid replay window size %d: %w", size, err)
+	}
+	return newESPRegistry(size), nil
+}
+
+func newESPRegistry(size uint32) *ESPRegistry {
+	return &ESPRegistry{replayWindowSize: size, inbound: make(map[uint32]*Association), bySPI: make(map[uint32]*Association), byIKE: make(map[isakmp.Cookie]map[*Association]struct{}), latest: make(map[isakmp.Cookie]*Association)}
 }
 
 func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
@@ -53,7 +81,7 @@ func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
 	if pair.Transform.LifetimeKilobytes != 0 {
 		limits.Bytes = uint64(pair.Transform.LifetimeKilobytes) * 1024
 	}
-	inbound, err := esp.NewSA(esp.SAConfig{SPI: pair.Inbound.SPI, Transform: pair.Transform, EncryptionKey: pair.Inbound.EncryptionKey, AuthenticationKey: pair.Inbound.AuthenticationKey, Lifetime: lifetime, Limits: limits})
+	inbound, err := esp.NewSA(esp.SAConfig{ReplayWindowSize: r.replayWindowSize, SPI: pair.Inbound.SPI, Transform: pair.Transform, EncryptionKey: pair.Inbound.EncryptionKey, AuthenticationKey: pair.Inbound.AuthenticationKey, Lifetime: lifetime, Limits: limits})
 	if err != nil {
 		return err
 	}
@@ -64,6 +92,9 @@ func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	session := &Association{owner: r, peerIP: append(net.IP(nil), ip...), peer: clonePeer(peer), inbound: inbound, outbound: outbound, encapsulation: pair.Transform.Encapsulation, inboundSPI: pair.Inbound.SPI, outboundSPI: pair.Outbound.SPI, ikeCookie: pair.ResponderCookie}
+	if lifetime > 0 {
+		session.expiresAt = time.Now().Add(lifetime)
+	}
 	if old := r.bySPI[pair.Inbound.SPI]; old != nil {
 		r.removeLocked(old)
 	}
@@ -298,3 +329,23 @@ func addressIP(peer net.Addr) net.IP {
 }
 
 func (r *ESPRegistry) String() string { return fmt.Sprintf("ESPRegistry{%d}", r.Count()) }
+
+// Active reports whether encrypted packets retained for asynchronous sending may
+// still use this association. Revocation and time expiry invalidate queued
+// packets. A write already in progress may complete concurrently with removal.
+func (s *Association) Active() bool {
+	return s != nil && s.owner != nil && !s.revoked.Load() && (s.expiresAt.IsZero() || time.Now().Before(s.expiresAt))
+}
+
+// ReplayState snapshots receive state for diagnostics after Open rejects a
+// packet. The snapshot may reflect subsequent traffic and is not authentication.
+func (r *ESPRegistry) ReplayState(peer net.Addr, wire []byte) (esp.ReplayState, bool) {
+	if len(wire) < 8 {
+		return esp.ReplayState{}, false
+	}
+	session, err := r.lookup(peer, wire)
+	if err != nil {
+		return esp.ReplayState{}, false
+	}
+	return session.inbound.ReplayState(binary.BigEndian.Uint32(wire[4:8])), true
+}
