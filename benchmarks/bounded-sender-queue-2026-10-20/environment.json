@@ -1,0 +1,21 @@
+{
+ "date": "2026-10-20",
+ "app_revision": "4c5cddb905662c7f5be7d42d7ee2f0695c690ffb",
+ "ipsec_revision": "25a512ad75695fa2efe3c6574fe103fa4152c750",
+ "l2tp_revision": "d617ab9b8f21925cd37b1bfe55533e3fcb09dd7b",
+ "module_comparator_revision": "4480587c57143bba2b0828a63b0eb7d07a2e1f9e",
+ "go_version": "go1.25.4",
+ "host_cpu": "Apple M1 Max",
+ "app_test_platform": "Linux ARM64 Docker Desktop, 10 vCPUs",
+ "module_test_platform": "macOS ARM64, native Go",
+ "sender_queue_capacity": 64,
+ "app_inbound_replay_window": 1024,
+ "client": "strongSwan 5.9.13 + xl2tpd 1.3.18 + pppd 2.5.0",
+ "reference_server": "strongSwan 5.9.13 + xl2tpd 1.3.18 + pppd 2.5.0, kernel ESP/PPPoL2TP",
+ "iperf3_version": "3.17.1",
+ "trials_per_direction": 2,
+ "measured_seconds": 10,
+ "omitted_seconds": 2,
+ "mtu": 1400,
+ "streams": 1
+}

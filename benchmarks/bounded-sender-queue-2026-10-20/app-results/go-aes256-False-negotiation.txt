@@ -1,0 +1,25 @@
+initiating Main Mode IKE_SA bench[1] to 172.29.231.2
+generating ID_PROT request 0 [ SA V V V V V ]
+sending packet: from 172.29.231.3[500] to 172.29.231.2[500] (180 bytes)
+received packet: from 172.29.231.2[500] to 172.29.231.3[500] (124 bytes)
+parsed ID_PROT response 0 [ SA V V ]
+received NAT-T (RFC 3947) vendor ID
+received DPD vendor ID
+selected proposal: IKE:AES_CBC_128/HMAC_SHA1_96/PRF_HMAC_SHA1/MODP_2048
+generating ID_PROT request 0 [ KE No NAT-D NAT-D ]
+sending packet: from 172.29.231.3[500] to 172.29.231.2[500] (372 bytes)
+received packet: from 172.29.231.2[500] to 172.29.231.3[500] (360 bytes)
+parsed ID_PROT response 0 [ KE No NAT-D NAT-D ]
+generating ID_PROT request 0 [ ID HASH N(INITIAL_CONTACT) ]
+sending packet: from 172.29.231.3[500] to 172.29.231.2[500] (108 bytes)
+received packet: from 172.29.231.2[500] to 172.29.231.3[500] (76 bytes)
+parsed ID_PROT response 0 [ ID HASH ]
+IKE_SA bench[1] established between 172.29.231.3[172.29.231.3]...172.29.231.2[172.29.231.2]
+generating QUICK_MODE request 129626112 [ HASH SA No ID ID ]
+sending packet: from 172.29.231.3[500] to 172.29.231.2[500] (172 bytes)
+received packet: from 172.29.231.2[500] to 172.29.231.3[500] (156 bytes)
+parsed QUICK_MODE response 129626112 [ HASH SA No ID ID ]
+selected proposal: ESP:AES_CBC_256/HMAC_SHA1_96/NO_EXT_SEQ
+received 3600s lifetime, configured 0s
+CHILD_SA bench{1} established with SPIs ceb2a828_i a1053fc0_o and TS 172.29.231.3/32[udp/l2f] === 172.29.231.2/32[udp/l2f]
+connection 'bench' established successfully

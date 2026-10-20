@@ -1,0 +1,29 @@
+initiating Main Mode IKE_SA bench[1] to 172.29.231.2
+generating ID_PROT request 0 [ SA V V V V V ]
+sending packet: from 172.29.231.3[500] to 172.29.231.2[500] (180 bytes)
+received packet: from 172.29.231.2[500] to 172.29.231.3[500] (160 bytes)
+parsed ID_PROT response 0 [ SA V V V V ]
+received XAuth vendor ID
+received DPD vendor ID
+received FRAGMENTATION vendor ID
+received NAT-T (RFC 3947) vendor ID
+selected proposal: IKE:AES_CBC_128/HMAC_SHA1_96/PRF_HMAC_SHA1/MODP_2048
+generating ID_PROT request 0 [ KE No NAT-D NAT-D ]
+sending packet: from 172.29.231.3[500] to 172.29.231.2[500] (372 bytes)
+received packet: from 172.29.231.2[500] to 172.29.231.3[500] (372 bytes)
+parsed ID_PROT response 0 [ KE No NAT-D NAT-D ]
+remote host is behind NAT
+generating ID_PROT request 0 [ ID HASH N(INITIAL_CONTACT) ]
+sending packet: from 172.29.231.3[4500] to 172.29.231.2[4500] (108 bytes)
+received packet: from 172.29.231.2[4500] to 172.29.231.3[4500] (76 bytes)
+parsed ID_PROT response 0 [ ID HASH ]
+IKE_SA bench[1] established between 172.29.231.3[172.29.231.3]...172.29.231.2[172.29.231.2]
+generating QUICK_MODE request 2699025251 [ HASH SA No ID ID NAT-OA NAT-OA ]
+sending packet: from 172.29.231.3[4500] to 172.29.231.2[4500] (188 bytes)
+received packet: from 172.29.231.2[4500] to 172.29.231.3[4500] (188 bytes)
+parsed QUICK_MODE response 2699025251 [ HASH SA No ID ID NAT-OA NAT-OA ]
+selected proposal: ESP:3DES_CBC/HMAC_SHA1_96/NO_EXT_SEQ
+received 28800s lifetime, configured 0s
+CHILD_SA bench{1} established with SPIs ce8fd5a7_i c55c94b8_o and TS 172.29.231.3/32[udp/l2f] === 172.29.231.2/32[udp/l2f]
+generating QUICK_MODE request 2699025251 [ HASH ]
+connection 'bench' established successfully

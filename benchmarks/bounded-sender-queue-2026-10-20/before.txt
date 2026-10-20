@@ -1,0 +1,12 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/eukhlg/ipsec-go/protocol/esp
+cpu: Apple M1 Max
+BenchmarkSeal/64-10 	 1329806	       897.9 ns/op	  71.28 MB/s	    1112 B/op	       8 allocs/op
+BenchmarkSeal/64-10 	 1354665	       895.2 ns/op	  71.49 MB/s	    1112 B/op	       8 allocs/op
+BenchmarkSeal/64-10 	 1331572	       911.5 ns/op	  70.21 MB/s	    1112 B/op	       8 allocs/op
+BenchmarkSeal/1400-10         	  400846	      3051 ns/op	 458.80 MB/s	    2520 B/op	       8 allocs/op
+BenchmarkSeal/1400-10         	  400491	      3000 ns/op	 466.65 MB/s	    2520 B/op	       8 allocs/op
+BenchmarkSeal/1400-10         	  405822	      2965 ns/op	 472.19 MB/s	    2520 B/op	       8 allocs/op
+PASS
+ok  	github.com/eukhlg/ipsec-go/protocol/esp	10.673s

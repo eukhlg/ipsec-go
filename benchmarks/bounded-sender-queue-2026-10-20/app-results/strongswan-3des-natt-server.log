@@ -1,0 +1,44 @@
+xl2tpd[39]: Not looking for kernel SAref support.
+xl2tpd[39]: Using l2tp kernel support.
+xl2tpd[39]: xl2tpd version xl2tpd-1.3.18 started on a52999a63c4f PID:39
+xl2tpd[39]: Written by Mark Spencer, Copyright (C) 1998, Adtran, Inc.
+xl2tpd[39]: Forked by Scott Balmos and David Stipp, (C) 2001
+xl2tpd[39]: Inherited by Jeff McAdams, (C) 2002
+xl2tpd[39]: Forked again by Xelerance (www.xelerance.com) (C) 2006-2016
+xl2tpd[39]: Listening on IP address 0.0.0.0, port 1701
+xl2tpd[39]: Connection established to 172.29.231.3, 1701.  Local: 20580, Remote: 45032 (ref=0/0).  LNS session is 'default'
+xl2tpd[39]: control_finish: Warning: Peer did not specify transmit speed
+xl2tpd[39]: Call established with 172.29.231.3, PID: 85, Local: 47168, Remote: 12540, Serial: 1
+Warning: couldn't open ppp database /run/ppp/pppd2.tdb
+using channel 1
+Using interface ppp0
+Connect: ppp0 <--> 
+Overriding mtu 1500 to 1400
+PPPoL2TP options: lnsmode tid 20580 sid 47168 debugmask 0
+Overriding mru 1500 to mtu value 1400
+sent [LCP ConfReq id=0x1 <mru 1400> <auth pap> <magic 0x85c9fcf1>]
+rcvd [LCP ConfAck id=0x1 <mru 1400> <auth pap> <magic 0x85c9fcf1>]
+sent [LCP ConfReq id=0x1 <mru 1400> <auth pap> <magic 0x85c9fcf1>]
+rcvd [LCP ConfReq id=0x1 <mru 1400> <magic 0xfbc8d8cf>]
+sent [LCP ConfAck id=0x1 <mru 1400> <magic 0xfbc8d8cf>]
+rcvd [LCP ConfAck id=0x1 <mru 1400> <auth pap> <magic 0x85c9fcf1>]
+PPPoL2TP options: lnsmode tid 20580 sid 47168 debugmask 0
+rcvd [PAP AuthReq id=0x1 user="bench" password=<hidden>]
+sent [PAP AuthAck id=0x1 "Login ok"]
+PAP peer authentication succeeded for bench
+sent [IPCP ConfReq id=0x1 <addr 10.77.0.1>]
+sent [IPV6CP ConfReq id=0x1 <addr fe80::c4a4:50e1:cc03:527c>]
+rcvd [IPCP ConfReq id=0x1 <addr 172.29.231.3>]
+sent [IPCP ConfNak id=0x1 <addr 10.77.0.2>]
+rcvd [IPV6CP ConfReq id=0x1 <addr fe80::48b6:054d:dadd:b061>]
+sent [IPV6CP ConfAck id=0x1 <addr fe80::48b6:054d:dadd:b061>]
+rcvd [IPCP ConfAck id=0x1 <addr 10.77.0.1>]
+rcvd [IPV6CP ConfAck id=0x1 <addr fe80::c4a4:50e1:cc03:527c>]
+local  LL address fe80::c4a4:50e1:cc03:527c
+remote LL address fe80::48b6:054d:dadd:b061
+rcvd [IPCP ConfReq id=0x2 <addr 10.77.0.2>]
+sent [IPCP ConfAck id=0x2 <addr 10.77.0.2>]
+local  IP address 10.77.0.1
+remote IP address 10.77.0.2
+Script /etc/ppp/ip-up started (pid 86)
+Script /etc/ppp/ip-up finished (pid 86), status = 0x0

@@ -1,0 +1,12 @@
+overture-vpn: go1.25.4
+	path	github.com/eukhlg/overture-vpn/cmd/overture-vpn
+	mod	github.com/eukhlg/overture-vpn	(devel)	
+	dep	github.com/eukhlg/ipsec-go	(devel)	
+	dep	github.com/eukhlg/l2tp-go	(devel)	
+	dep	github.com/pelletier/go-toml/v2	v2.4.2	h1:M2fKKbmyvI+hGId/D0W64qDBMVhJnNR10O5gIbMc//Q=
+	build	-buildmode=exe
+	build	-compiler=gc
+	build	CGO_ENABLED=0
+	build	GOARCH=arm64
+	build	GOOS=linux
+	build	GOARM64=v8.0

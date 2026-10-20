@@ -1,0 +1,34 @@
+[
+  {
+    "label": "strongSwan, client window 1024 only",
+    "upload": 722.4659993334751,
+    "upload_range": "682.4\u2013762.6",
+    "download": 1382.9863792268616,
+    "download_range": "1370.2\u20131395.8",
+    "replay_rejections": {
+      "client-xfrm.txt": 0,
+      "server-xfrm.txt": 30552
+    }
+  },
+  {
+    "label": "strongSwan, both windows 1024",
+    "upload": 1388.719942168655,
+    "upload_range": "1374.6\u20131402.8",
+    "download": 1404.9419912666344,
+    "download_range": "1404.9\u20131405.0",
+    "replay_rejections": {
+      "client-xfrm.txt": 0,
+      "server-xfrm.txt": 0
+    }
+  },
+  {
+    "label": "Our app, both windows 1024",
+    "upload": 538.4462019463451,
+    "upload_range": "536.9\u2013540.0",
+    "download": 698.3525579686341,
+    "download_range": "696.0\u2013700.7",
+    "replay_rejections": {
+      "client-xfrm.txt": 0
+    }
+  }
+]
