@@ -28,6 +28,7 @@ type Association struct {
 	encapsulation           uint16
 	inboundSPI, outboundSPI uint32
 	ikeCookie               isakmp.Cookie
+	expiresAt               time.Time
 	revoked                 atomic.Bool
 }
 
@@ -64,6 +65,9 @@ func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	session := &Association{owner: r, peerIP: append(net.IP(nil), ip...), peer: clonePeer(peer), inbound: inbound, outbound: outbound, encapsulation: pair.Transform.Encapsulation, inboundSPI: pair.Inbound.SPI, outboundSPI: pair.Outbound.SPI, ikeCookie: pair.ResponderCookie}
+	if lifetime > 0 {
+		session.expiresAt = time.Now().Add(lifetime)
+	}
 	if old := r.bySPI[pair.Inbound.SPI]; old != nil {
 		r.removeLocked(old)
 	}
@@ -298,3 +302,10 @@ func addressIP(peer net.Addr) net.IP {
 }
 
 func (r *ESPRegistry) String() string { return fmt.Sprintf("ESPRegistry{%d}", r.Count()) }
+
+// Active reports whether encrypted packets retained for asynchronous sending may
+// still use this association. Revocation and time expiry invalidate queued
+// packets. A write already in progress may complete concurrently with removal.
+func (s *Association) Active() bool {
+	return s != nil && s.owner != nil && !s.revoked.Load() && (s.expiresAt.IsZero() || time.Now().Before(s.expiresAt))
+}
