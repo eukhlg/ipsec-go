@@ -26,9 +26,10 @@ var large = sync.Pool{New: func() any { return &Buffer{storage: make([]byte, lar
 // borrowed Bytes views expire on mutation, transfer, or Release. It is not safe
 // for concurrent use. A successful queue submission transfers ownership.
 type Buffer struct {
-	storage    []byte
-	start, end int
-	released   bool
+	storage              []byte
+	start, end           int
+	dirtyStart, dirtyEnd int
+	released             bool
 }
 
 func Acquire(size int) (*Buffer, error) {
@@ -43,6 +44,7 @@ func Acquire(size int) (*Buffer, error) {
 	b.released = false
 	b.start = Headroom
 	b.end = Headroom + size
+	b.dirtyStart, b.dirtyEnd = 0, 0
 	return b, nil
 }
 func Copy(data []byte) (*Buffer, error) {
@@ -52,13 +54,30 @@ func Copy(data []byte) (*Buffer, error) {
 	}
 	return b, err
 }
-func (b *Buffer) Bytes() []byte { return b.storage[b.start:b.end:b.end] }
-func (b *Buffer) Len() int      { return b.end - b.start }
+func (b *Buffer) Bytes() []byte {
+	b.expose(b.start, b.end)
+	return b.storage[b.start:b.end:b.end]
+}
+
+// expose records a conservative union: trimming a view never makes bytes clean.
+func (b *Buffer) expose(start, end int) {
+	if start == end {
+		return
+	}
+	if b.dirtyEnd == 0 {
+		b.dirtyStart, b.dirtyEnd = start, end
+		return
+	}
+	b.dirtyStart = min(b.dirtyStart, start)
+	b.dirtyEnd = max(b.dirtyEnd, end)
+}
+func (b *Buffer) Len() int { return b.end - b.start }
 func (b *Buffer) Prepend(n int) ([]byte, error) {
 	if n < 0 || n > b.start {
 		return nil, ErrSize
 	}
 	b.start -= n
+	b.expose(b.start, b.start+n)
 	return b.storage[b.start : b.start+n : b.start+n], nil
 }
 func (b *Buffer) Append(n int) ([]byte, error) {
@@ -67,6 +86,7 @@ func (b *Buffer) Append(n int) ([]byte, error) {
 	}
 	old := b.end
 	b.end += n
+	b.expose(old, b.end)
 	return b.storage[old:b.end:b.end], nil
 }
 func (b *Buffer) TrimFront(n int) error {
@@ -86,14 +106,16 @@ func (b *Buffer) Truncate(n int) error {
 func (b *Buffer) Headroom() int { return b.start }
 func (b *Buffer) Tailroom() int { return len(b.storage) - b.end }
 
-// Release clears all storage, including consumed headers and failed decryptions.
+// Release clears all potentially written storage, including consumed headers,
+// truncated views and failed decryptions. Unexposed storage is already zero.
 // Exactly one owner must call it exactly once; no references may survive it.
 func (b *Buffer) Release() {
 	if b.released {
 		panic("packet buffer: double release")
 	}
 	b.released = true
-	clear(b.storage)
+	clear(b.storage[b.dirtyStart:b.dirtyEnd])
+	b.dirtyStart, b.dirtyEnd = 0, 0
 	b.start = 0
 	b.end = 0
 	if len(b.storage) == smallSize {

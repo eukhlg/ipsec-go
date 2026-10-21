@@ -152,6 +152,7 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 	}
 	buffers := make([]*packetbuf.Buffer, 0, size)
 	messages := make([]udptransport.Message, size)
+	receiveSlots := make([]packetbuf.ReceiveSlot, size)
 	defer func() {
 		for _, b := range buffers {
 			if b != nil {
@@ -165,22 +166,18 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 			return err
 		}
 		buffers = append(buffers, b)
-		messages[i].Payload = b.Bytes()
+		receiveSlots[i].Buffer = b
 	}
 
 	handler := s.HandlePacket
 	if s.HandlePacketInPlace != nil {
 		handler = s.HandlePacketInPlace
 	}
-	for {
-		if ctx.Err() != nil {
-			return nil
-		}
-		if err := s.Conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-			return err
-		}
-		if ctx.Err() != nil {
-			return nil
+	// The socket owns only this synchronous writable loan. Returned lengths
+	// bound erasure; ordinary Bytes exposure would conservatively dirty 64 KiB.
+	read := func(slots []packetbuf.ReceiveSlot) (int, error) {
+		for i := range slots {
+			messages[i].Payload = slots[i].Payload
 		}
 		var count int
 		var err error
@@ -192,6 +189,29 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 				count = 1
 			}
 		}
+		for i := 0; i < count; i++ {
+			slots[i].N = messages[i].N
+			if messages[i].Truncated {
+				slots[i].N = len(slots[i].Payload)
+			}
+		}
+		return count, err
+	}
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err := s.Conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			return err
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		count, err := packetbuf.Receive(receiveSlots, read)
+		for i := 0; i < count; i++ {
+			messages[i].Payload = receiveSlots[i].Payload
+		}
+
 		for i := 0; i < count; i++ {
 			if ctx.Err() != nil {
 				return nil
@@ -213,7 +233,7 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 					return processErr
 				}
 			}
-			// Each packet has one owner. Release erases all storage, including
+			// Each packet has one owner. Release erases all potentially written storage, including
 			// plaintext outside the received wire view, before pool reuse.
 			if buffers[i] != nil {
 				release(buffers[i])
@@ -224,7 +244,7 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 				return acquireErr
 			}
 			buffers[i] = b
-			m.Payload = b.Bytes()
+			receiveSlots[i].Buffer = b
 		}
 		if err != nil {
 			if ctx.Err() != nil {
