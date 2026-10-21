@@ -10,6 +10,7 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"io"
 	"sync"
 	"time"
@@ -31,19 +32,29 @@ type SAConfig struct {
 	Now                              func() time.Time
 }
 
+// Standard-library AES and 3DES CBC modes expose SetIV for independent packets.
+// Keep separate directions because CryptBlocks advances the mode's chaining IV.
+type cbcMode interface {
+	cipher.BlockMode
+	SetIV([]byte)
+}
+
 type SA struct {
-	mu             sync.Mutex
-	spi            uint32
-	block          cipher.Block
-	authKey        []byte
-	random         io.Reader
-	sequence       uint32
-	replay         ReplayWindow
-	packets, bytes uint64
-	limits         Limits
-	lifetime       time.Duration
-	created        time.Time
-	now            func() time.Time
+	mu               sync.Mutex
+	spi              uint32
+	block            cipher.Block
+	encrypt, decrypt cbcMode
+	sealIV           [aes.BlockSize]byte
+	mac              hash.Hash
+	icv              [sha1.Size]byte
+	random           io.Reader
+	sequence         uint32
+	replay           ReplayWindow
+	packets, bytes   uint64
+	limits           Limits
+	lifetime         time.Duration
+	created          time.Time
+	now              func() time.Time
 }
 
 func NewSA(config SAConfig) (*SA, error) {
@@ -73,7 +84,10 @@ func NewSA(config SAConfig) (*SA, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &SA{replay: replay, spi: config.SPI, block: block, authKey: append([]byte(nil), config.AuthenticationKey...), random: config.Random, limits: config.Limits, lifetime: config.Lifetime, created: config.Now(), now: config.Now}, nil
+	var iv [aes.BlockSize]byte
+	encrypt := cipher.NewCBCEncrypter(block, iv[:block.BlockSize()]).(cbcMode)
+	decrypt := cipher.NewCBCDecrypter(block, iv[:block.BlockSize()]).(cbcMode)
+	return &SA{encrypt: encrypt, decrypt: decrypt, replay: replay, spi: config.SPI, block: block, mac: hmac.New(sha1.New, config.AuthenticationKey), random: config.Random, limits: config.Limits, lifetime: config.Lifetime, created: config.Now(), now: config.Now}, nil
 }
 
 func (s *SA) SPI() uint32 { return s.spi }
@@ -111,8 +125,8 @@ func (s *SA) SealBuffer(b *packetbuf.Buffer, nextHeader uint8) error {
 		return packetbuf.ErrSize
 	}
 	// Generate before mutating the packet or consuming sequence/lifetime state.
-	var randomIV [16]byte
-	if _, err := io.ReadFull(s.random, randomIV[:blockSize]); err != nil {
+	if _, err := io.ReadFull(s.random, s.sealIV[:blockSize]); err != nil {
+		clear(s.sealIV[:])
 		return err
 	}
 	header, _ := b.Prepend(headerSize)
@@ -120,8 +134,8 @@ func (s *SA) SealBuffer(b *packetbuf.Buffer, nextHeader uint8) error {
 	s.sequence++
 	binary.BigEndian.PutUint32(header[:4], s.spi)
 	binary.BigEndian.PutUint32(header[4:8], s.sequence)
-	copy(header[HeaderSize:], randomIV[:blockSize])
-	clear(randomIV[:])
+	copy(header[HeaderSize:], s.sealIV[:blockSize])
+	clear(s.sealIV[:])
 	for i := 0; i < padLength; i++ {
 		tail[i] = byte(i + 1)
 	}
@@ -129,8 +143,9 @@ func (s *SA) SealBuffer(b *packetbuf.Buffer, nextHeader uint8) error {
 	wire := b.Bytes()
 	authEnd := len(wire) - ICVSizeHMACSHA196
 	plain := wire[headerSize:authEnd]
-	cipher.NewCBCEncrypter(s.block, header[HeaderSize:]).CryptBlocks(plain, plain)
-	copy(wire[authEnd:], calculateICV(s.authKey, wire[:authEnd]))
+	s.encrypt.SetIV(header[HeaderSize:])
+	s.encrypt.CryptBlocks(plain, plain)
+	copy(wire[authEnd:], s.calculateICV(wire[:authEnd]))
 	s.packets++
 	s.bytes += uint64(size)
 	return nil
@@ -163,12 +178,13 @@ func (s *SA) OpenInPlace(wire []byte) ([]byte, uint8, error) {
 	if err = s.replay.Check(packet.Sequence); err != nil {
 		return nil, 0, err
 	}
-	want := calculateICV(s.authKey, wire[:len(wire)-ICVSizeHMACSHA196])
+	want := s.calculateICV(wire[:len(wire)-ICVSizeHMACSHA196])
 	if subtle.ConstantTimeCompare(want, packet.ICV) != 1 {
 		return nil, 0, ErrAuthentication
 	}
 	plain := packet.Ciphertext
-	cipher.NewCBCDecrypter(s.block, packet.IV).CryptBlocks(plain, plain)
+	s.decrypt.SetIV(packet.IV)
+	s.decrypt.CryptBlocks(plain, plain)
 	padLength := int(plain[len(plain)-2])
 	if padLength+2 > len(plain) {
 		return nil, 0, ErrInvalidPacket
@@ -205,8 +221,10 @@ func (s *SA) checkLifetime(nextBytes uint64) error {
 	return nil
 }
 
-func calculateICV(key, wire []byte) []byte {
-	mac := hmac.New(sha1.New, key)
-	_, _ = mac.Write(wire)
-	return mac.Sum(nil)[:ICVSizeHMACSHA196]
+// calculateICV reuses keyed state and digest storage under s.mu. The result is
+// borrowed until the next call and must be consumed before releasing the lock.
+func (s *SA) calculateICV(wire []byte) []byte {
+	s.mac.Reset()
+	_, _ = s.mac.Write(wire)
+	return s.mac.Sum(s.icv[:0])[:ICVSizeHMACSHA196]
 }

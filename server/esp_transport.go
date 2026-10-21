@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/eukhlg/ipsec-go/packetbuf"
@@ -20,7 +21,19 @@ type ESPPacketResult struct {
 }
 type ESPPacketHandler func(context.Context, net.Addr, []byte, time.Time) (ESPPacketResult, error)
 
+// ESPDeliveryCapacity bounds pending borrowed packets per listener. Together
+// with the receive batch and one executing callback this bounds packet storage.
+const ESPDeliveryCapacity = 64
+
+type espDelivery struct {
+	dispatch func(context.Context) error
+	buffer   *packetbuf.Buffer
+}
+
 type ESPTransportServer struct {
+	closeMu sync.Mutex
+	closed  chan struct{}
+
 	Conn         net.PacketConn
 	HandlePacket ESPPacketHandler
 	// HandlePacketInPlace, when set, may mutate the owned receive buffer and
@@ -82,10 +95,56 @@ func NewNATTServer(conn net.PacketConn, handler ESPPacketHandler, control *isakm
 	return &ESPTransportServer{Conn: conn, HandlePacket: handler, ControlPlane: control, NATT: true}, nil
 }
 
-func (s *ESPTransportServer) Serve(ctx context.Context) error {
+func (s *ESPTransportServer) Serve(parent context.Context) error {
+	return s.serve(parent, packetbuf.Acquire, (*packetbuf.Buffer).Release)
+}
+
+// The private pool seam permits exact ownership accounting in receive tests.
+func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*packetbuf.Buffer, error), release func(*packetbuf.Buffer)) (serveErr error) {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
 	if s.Conn == nil || (s.HandlePacket == nil && s.HandlePacketInPlace == nil) {
 		return errors.New("esp transport server: missing connection or handler")
 	}
+	queue := make(chan espDelivery, ESPDeliveryCapacity)
+	deliveryDone := make(chan struct{})
+	var deliveryErr error // published by closing deliveryDone
+	go func() {
+		defer close(deliveryDone)
+		for item := range queue {
+			if ctx.Err() == nil {
+				if err := item.dispatch(ctx); err != nil {
+					deliveryErr = err
+					cancel()
+				}
+			}
+			release(item.buffer)
+		}
+	}()
+	stopped := make(chan struct{})
+	closed := s.closeSignal()
+	go func() {
+		defer close(stopped)
+		select {
+		case <-ctx.Done():
+		case <-closed:
+			cancel()
+		}
+		// Wake a pending socket read. The connection remains owned by the caller.
+		_ = s.Conn.SetReadDeadline(time.Now())
+	}()
+	defer func() {
+		cancel()
+		close(queue)
+		<-deliveryDone
+		<-stopped
+		if deliveryErr != nil {
+			serveErr = deliveryErr
+		} else if parent.Err() != nil {
+			serveErr = nil
+		}
+	}()
+
 	size := 1
 	udp := udptransport.New(s.Conn)
 	if s.NATT {
@@ -93,30 +152,32 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 	}
 	buffers := make([]*packetbuf.Buffer, 0, size)
 	messages := make([]udptransport.Message, size)
+	receiveSlots := make([]packetbuf.ReceiveSlot, size)
 	defer func() {
 		for _, b := range buffers {
-			b.Release()
+			if b != nil {
+				release(b)
+			}
 		}
 	}()
 	for i := range messages {
-		b, err := packetbuf.Acquire(packetbuf.MaxPacket)
+		b, err := acquire(packetbuf.MaxPacket)
 		if err != nil {
 			return err
 		}
 		buffers = append(buffers, b)
-		messages[i].Payload = b.Bytes()
+		receiveSlots[i].Buffer = b
 	}
 
 	handler := s.HandlePacket
 	if s.HandlePacketInPlace != nil {
 		handler = s.HandlePacketInPlace
 	}
-	for {
-		if ctx.Err() != nil {
-			return nil
-		}
-		if err := s.Conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-			return err
+	// The socket owns only this synchronous writable loan. Returned lengths
+	// bound erasure; ordinary Bytes exposure would conservatively dirty 64 KiB.
+	read := func(slots []packetbuf.ReceiveSlot) (int, error) {
+		for i := range slots {
+			messages[i].Payload = slots[i].Payload
 		}
 		var count int
 		var err error
@@ -129,16 +190,61 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 			}
 		}
 		for i := 0; i < count; i++ {
+			slots[i].N = messages[i].N
+			if messages[i].Truncated {
+				slots[i].N = len(slots[i].Payload)
+			}
+		}
+		return count, err
+	}
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err := s.Conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			return err
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		count, err := packetbuf.Receive(receiveSlots, read)
+		for i := 0; i < count; i++ {
+			messages[i].Payload = receiveSlots[i].Payload
+		}
+
+		for i := 0; i < count; i++ {
 			if ctx.Err() != nil {
 				return nil
 			}
 			m := &messages[i]
 			if !m.Truncated && m.N >= 0 && m.N <= len(m.Payload) {
-				if processErr := s.processMessage(ctx, handler, m.Peer, m.Payload[:m.N:m.N]); processErr != nil {
+				if processErr := s.processMessageDispatch(ctx, handler, m.Peer, m.Payload[:m.N:m.N], func(dispatch func(context.Context) error) error {
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					select {
+					case queue <- espDelivery{dispatch: dispatch, buffer: buffers[i]}:
+						buffers[i] = nil // successful enqueue transfers exclusive ownership
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}); processErr != nil {
 					return processErr
 				}
 			}
-			clear(m.Payload[:min(max(m.N, 0), len(m.Payload))]) // Dispatch is synchronous; erase before any buffer reuse.
+			// Each packet has one owner. Release erases all potentially written storage, including
+			// plaintext outside the received wire view, before pool reuse.
+			if buffers[i] != nil {
+				release(buffers[i])
+			}
+			buffers[i] = nil
+			b, acquireErr := acquire(packetbuf.MaxPacket)
+			if acquireErr != nil {
+				return acquireErr
+			}
+			buffers[i] = b
+			receiveSlots[i].Buffer = b
 		}
 		if err != nil {
 			if ctx.Err() != nil {
@@ -159,6 +265,10 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 }
 
 func (s *ESPTransportServer) processMessage(ctx context.Context, handler ESPPacketHandler, peer net.Addr, wire []byte) error {
+	return s.processMessageDispatch(ctx, handler, peer, wire, func(dispatch func(context.Context) error) error { return dispatch(ctx) })
+}
+
+func (s *ESPTransportServer) processMessageDispatch(ctx context.Context, handler ESPPacketHandler, peer net.Addr, wire []byte, deliver func(func(context.Context) error) error) error {
 	n := len(wire)
 	if s.NATT {
 		kind, payload := esp.ClassifyNATT(wire)
@@ -225,7 +335,7 @@ func (s *ESPTransportServer) processMessage(ctx context.Context, handler ESPPack
 			}
 		}
 		if result.Dispatch != nil {
-			return result.Dispatch(ctx)
+			return deliver(result.Dispatch)
 		}
 		return nil
 	}(); err != nil {
@@ -244,7 +354,26 @@ func (s *ESPTransportServer) trace(format string, args ...any) {
 		s.Tracef(format, args...)
 	}
 }
+func (s *ESPTransportServer) closeSignal() <-chan struct{} {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if s.closed == nil {
+		s.closed = make(chan struct{})
+	}
+	return s.closed
+}
+
 func (s *ESPTransportServer) Close() error {
+	s.closeMu.Lock()
+	if s.closed == nil {
+		s.closed = make(chan struct{})
+	}
+	select {
+	case <-s.closed:
+	default:
+		close(s.closed)
+	}
+	s.closeMu.Unlock()
 	if s.Conn == nil {
 		return nil
 	}
