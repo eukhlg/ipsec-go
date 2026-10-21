@@ -95,7 +95,9 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 	messages := make([]udptransport.Message, size)
 	defer func() {
 		for _, b := range buffers {
-			b.Release()
+			if b != nil {
+				b.Release()
+			}
 		}
 	}()
 	for i := range messages {
@@ -138,7 +140,16 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 					return processErr
 				}
 			}
-			clear(m.Payload[:min(max(m.N, 0), len(m.Payload))]) // Dispatch is synchronous; erase before any buffer reuse.
+			// Each packet has one owner. Release erases all storage, including
+			// plaintext outside the received wire view, before pool reuse.
+			buffers[i].Release()
+			buffers[i] = nil
+			b, acquireErr := packetbuf.Acquire(packetbuf.MaxPacket)
+			if acquireErr != nil {
+				return acquireErr
+			}
+			buffers[i] = b
+			m.Payload = b.Bytes()
 		}
 		if err != nil {
 			if ctx.Err() != nil {
