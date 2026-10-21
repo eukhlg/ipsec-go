@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"crypto/cipher"
 	"errors"
-	"github.com/eukhlg/ipsec-go/packetbuf"
 	"github.com/eukhlg/ipsec-go/protocol/isakmp"
+	"github.com/eukhlg/netio/packetbuf"
 	"testing"
 )
 

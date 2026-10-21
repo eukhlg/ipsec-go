@@ -7,10 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/eukhlg/ipsec-go/packetbuf"
 	"github.com/eukhlg/ipsec-go/protocol/esp"
 	"github.com/eukhlg/ipsec-go/protocol/isakmp"
-	"github.com/eukhlg/ipsec-go/udptransport"
+	"github.com/eukhlg/netio/packetbuf"
+	"github.com/eukhlg/netio/udptransport"
 )
 
 // ESPPacketResult separates protocol replies from application event dispatch.

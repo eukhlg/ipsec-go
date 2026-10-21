@@ -9,9 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/eukhlg/ipsec-go/packetbuf"
 	"github.com/eukhlg/ipsec-go/protocol/esp"
 	"github.com/eukhlg/ipsec-go/protocol/isakmp"
+	"github.com/eukhlg/netio/packetbuf"
 )
 
 var (
