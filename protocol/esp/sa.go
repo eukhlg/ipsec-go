@@ -10,6 +10,7 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"io"
 	"sync"
 	"time"
@@ -35,7 +36,8 @@ type SA struct {
 	mu             sync.Mutex
 	spi            uint32
 	block          cipher.Block
-	authKey        []byte
+	mac            hash.Hash
+	icv            [sha1.Size]byte
 	random         io.Reader
 	sequence       uint32
 	replay         ReplayWindow
@@ -73,7 +75,7 @@ func NewSA(config SAConfig) (*SA, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &SA{replay: replay, spi: config.SPI, block: block, authKey: append([]byte(nil), config.AuthenticationKey...), random: config.Random, limits: config.Limits, lifetime: config.Lifetime, created: config.Now(), now: config.Now}, nil
+	return &SA{replay: replay, spi: config.SPI, block: block, mac: hmac.New(sha1.New, config.AuthenticationKey), random: config.Random, limits: config.Limits, lifetime: config.Lifetime, created: config.Now(), now: config.Now}, nil
 }
 
 func (s *SA) SPI() uint32 { return s.spi }
@@ -130,7 +132,7 @@ func (s *SA) SealBuffer(b *packetbuf.Buffer, nextHeader uint8) error {
 	authEnd := len(wire) - ICVSizeHMACSHA196
 	plain := wire[headerSize:authEnd]
 	cipher.NewCBCEncrypter(s.block, header[HeaderSize:]).CryptBlocks(plain, plain)
-	copy(wire[authEnd:], calculateICV(s.authKey, wire[:authEnd]))
+	copy(wire[authEnd:], s.calculateICV(wire[:authEnd]))
 	s.packets++
 	s.bytes += uint64(size)
 	return nil
@@ -163,7 +165,7 @@ func (s *SA) OpenInPlace(wire []byte) ([]byte, uint8, error) {
 	if err = s.replay.Check(packet.Sequence); err != nil {
 		return nil, 0, err
 	}
-	want := calculateICV(s.authKey, wire[:len(wire)-ICVSizeHMACSHA196])
+	want := s.calculateICV(wire[:len(wire)-ICVSizeHMACSHA196])
 	if subtle.ConstantTimeCompare(want, packet.ICV) != 1 {
 		return nil, 0, ErrAuthentication
 	}
@@ -205,8 +207,10 @@ func (s *SA) checkLifetime(nextBytes uint64) error {
 	return nil
 }
 
-func calculateICV(key, wire []byte) []byte {
-	mac := hmac.New(sha1.New, key)
-	_, _ = mac.Write(wire)
-	return mac.Sum(nil)[:ICVSizeHMACSHA196]
+// calculateICV reuses keyed state and digest storage under s.mu. The result is
+// borrowed until the next call and must be consumed before releasing the lock.
+func (s *SA) calculateICV(wire []byte) []byte {
+	s.mac.Reset()
+	_, _ = s.mac.Write(wire)
+	return s.mac.Sum(s.icv[:0])[:ICVSizeHMACSHA196]
 }
