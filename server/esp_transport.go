@@ -9,6 +9,7 @@ import (
 	"github.com/eukhlg/ipsec-go/packetbuf"
 	"github.com/eukhlg/ipsec-go/protocol/esp"
 	"github.com/eukhlg/ipsec-go/protocol/isakmp"
+	"github.com/eukhlg/ipsec-go/udptransport"
 )
 
 // ESPPacketResult separates protocol replies from application event dispatch.
@@ -85,23 +86,60 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 	if s.Conn == nil || (s.HandlePacket == nil && s.HandlePacketInPlace == nil) {
 		return errors.New("esp transport server: missing connection or handler")
 	}
-	owned, err := packetbuf.Acquire(packetbuf.MaxPacket)
-	if err != nil {
-		return err
+	size := 1
+	udp := udptransport.New(s.Conn)
+	if s.NATT {
+		size = udp.BatchSize()
 	}
-	defer owned.Release()
-	buffer := owned.Bytes()
+	buffers := make([]*packetbuf.Buffer, 0, size)
+	messages := make([]udptransport.Message, size)
+	defer func() {
+		for _, b := range buffers {
+			b.Release()
+		}
+	}()
+	for i := range messages {
+		b, err := packetbuf.Acquire(packetbuf.MaxPacket)
+		if err != nil {
+			return err
+		}
+		buffers = append(buffers, b)
+		messages[i].Payload = b.Bytes()
+	}
+
 	handler := s.HandlePacket
 	if s.HandlePacketInPlace != nil {
 		handler = s.HandlePacketInPlace
 	}
-	used := 0
 	for {
-		clear(buffer[:used]) // previous synchronous Dispatch has finished; erase plaintext
+		if ctx.Err() != nil {
+			return nil
+		}
 		if err := s.Conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 			return err
 		}
-		n, peer, err := s.Conn.ReadFrom(buffer)
+		var count int
+		var err error
+		if s.NATT {
+			count, err = udp.Read(messages)
+		} else {
+			messages[0].N, messages[0].Peer, err = s.Conn.ReadFrom(messages[0].Payload)
+			if err == nil {
+				count = 1
+			}
+		}
+		for i := 0; i < count; i++ {
+			if ctx.Err() != nil {
+				return nil
+			}
+			m := &messages[i]
+			if !m.Truncated && m.N >= 0 && m.N <= len(m.Payload) {
+				if processErr := s.processMessage(ctx, handler, m.Peer, m.Payload[:m.N:m.N]); processErr != nil {
+					return processErr
+				}
+			}
+			clear(m.Payload[:min(max(m.N, 0), len(m.Payload))]) // Dispatch is synchronous; erase before any buffer reuse.
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -117,81 +155,85 @@ func (s *ESPTransportServer) Serve(ctx context.Context) error {
 			}
 			return err
 		}
-		used = n
-		wire := buffer[:n:n]
-		if s.NATT {
-			kind, payload := esp.ClassifyNATT(wire)
-			s.trace("natt udp/4500 rx peer=%s bytes=%d kind=%d", peer, n, kind)
-			switch kind {
-			case esp.NATTKeepalive:
-				continue
-			case esp.NATTIKE:
-				if s.ControlPlane == nil {
-					continue
-				}
-				result, err := s.ControlPlane.HandleNATTDatagram(peer, payload, time.Now())
-				if err != nil {
-					s.debug("natt ike drop peer=%s bytes=%d error=%v", peer, len(payload), err)
-					if s.Lifecycle != nil {
-						if events := s.ControlPlane.Maintain(time.Now()); len(events) != 0 {
-							s.Lifecycle(ctx, events)
-						}
-					}
-					continue
-				}
-				if len(result.Reply) != 0 {
-					if _, err := s.Conn.WriteTo(esp.EncapsulateNATTIKE(result.Reply), peer); err != nil {
-						return err
-					}
-					s.debug("natt ike tx peer=%s bytes=%d", peer, len(result.Reply)+4)
-				}
-				if result.Established != nil && s.Established != nil {
-					s.Established(ctx, peer, *result.Established)
-				}
-				if len(result.Lifecycle) != 0 && s.Lifecycle != nil {
-					s.Lifecycle(ctx, result.Lifecycle)
-				}
+	}
+}
+
+func (s *ESPTransportServer) processMessage(ctx context.Context, handler ESPPacketHandler, peer net.Addr, wire []byte) error {
+	n := len(wire)
+	if s.NATT {
+		kind, payload := esp.ClassifyNATT(wire)
+		s.trace("natt udp/4500 rx peer=%s bytes=%d kind=%d", peer, n, kind)
+		switch kind {
+		case esp.NATTKeepalive:
+			return nil
+		case esp.NATTIKE:
+			if s.ControlPlane == nil {
+				return nil
+			}
+			result, err := s.ControlPlane.HandleNATTDatagram(peer, payload, time.Now())
+			if err != nil {
+				s.debug("natt ike drop peer=%s bytes=%d error=%v", peer, len(payload), err)
 				if s.Lifecycle != nil {
 					if events := s.ControlPlane.Maintain(time.Now()); len(events) != 0 {
 						s.Lifecycle(ctx, events)
 					}
 				}
-				continue
-			case esp.NATTESP:
-				wire = payload
-			default:
-				continue
+				return nil
 			}
-		}
-		result, err := handler(ctx, peer, wire, time.Now())
-		if err != nil {
-			s.debug("esp drop peer=%s natt=%t bytes=%d error=%v", peer, s.NATT, len(wire), err)
-			continue
-		}
-		if err := func() error {
-			defer func() {
-				for _, reply := range result.Datagrams {
-					reply.Release()
-				}
-			}()
-			for _, reply := range result.Datagrams {
-				if reply.NATT != s.NATT {
-					continue
-				}
-				// NAT-T ESP has no extra marker; write the same ciphertext directly.
-				if _, err := s.Conn.WriteTo(reply.Payload, reply.Peer); err != nil {
+			if len(result.Reply) != 0 {
+				if _, err := s.Conn.WriteTo(esp.EncapsulateNATTIKE(result.Reply), peer); err != nil {
 					return err
 				}
+				s.debug("natt ike tx peer=%s bytes=%d", peer, len(result.Reply)+4)
 			}
-			if result.Dispatch != nil {
-				return result.Dispatch(ctx)
+			if result.Established != nil && s.Established != nil {
+				s.Established(ctx, peer, *result.Established)
+			}
+			if len(result.Lifecycle) != 0 && s.Lifecycle != nil {
+				s.Lifecycle(ctx, result.Lifecycle)
+			}
+			if s.Lifecycle != nil {
+				if events := s.ControlPlane.Maintain(time.Now()); len(events) != 0 {
+					s.Lifecycle(ctx, events)
+				}
 			}
 			return nil
-		}(); err != nil {
-			return err
+		case esp.NATTESP:
+			wire = payload
+		default:
+			return nil
 		}
 	}
+	result, err := handler(ctx, peer, wire, time.Now())
+	if err != nil {
+		s.debug("esp drop peer=%s natt=%t bytes=%d error=%v", peer, s.NATT, len(wire), err)
+		return nil
+	}
+	if err := func() error {
+		defer func() {
+			for _, reply := range result.Datagrams {
+				reply.Release()
+			}
+		}()
+		for _, reply := range result.Datagrams {
+			if reply.NATT != s.NATT {
+				continue
+			}
+			// NAT-T ESP has no extra marker; write the same ciphertext directly.
+			if _, err := s.Conn.WriteTo(reply.Payload, reply.Peer); err != nil {
+				return err
+			}
+		}
+		if result.Dispatch != nil {
+			return result.Dispatch(ctx)
+		}
+		return nil
+	}(); err != nil {
+		return err
+	}
+	return nil
 }
+
 func (s *ESPTransportServer) debug(format string, args ...any) {
 	if s.Debugf != nil {
 		s.Debugf(format, args...)
