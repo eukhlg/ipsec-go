@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/eukhlg/ipsec-go/packetbuf"
 	"github.com/eukhlg/ipsec-go/protocol/esp"
 	"github.com/eukhlg/ipsec-go/protocol/isakmp"
 )
@@ -239,6 +240,16 @@ type ESPDatagram struct {
 	Payload []byte
 	Peer    net.Addr
 	NATT    bool
+	// Buffer, when non-nil, owns Payload. The recipient must release it once
+	// after its final use. Legacy Seal returns independent non-pooled Payload.
+	Buffer *packetbuf.Buffer
+}
+
+// Release relinquishes owned pooled storage; legacy datagrams need no release.
+func (d ESPDatagram) Release() {
+	if d.Buffer != nil {
+		d.Buffer.Release()
+	}
 }
 
 // Open authenticates and decrypts an ESP packet, preserving association identity.
@@ -272,6 +283,38 @@ func (r *ESPRegistry) Seal(session *Association, peer net.Addr, payload []byte, 
 		return ESPDatagram{}, err
 	}
 	return ESPDatagram{Payload: wire, Peer: peer, NATT: session.encapsulation == isakmp.EncapsulationNATTTransport}, nil
+}
+
+// OpenInPlace borrows and mutates wire; the payload aliases its storage.
+func (r *ESPRegistry) OpenInPlace(peer net.Addr, wire []byte) (*Association, []byte, uint8, error) {
+	session, err := r.lookup(peer, wire)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	payload, next, err := session.inbound.OpenInPlace(wire)
+	if errors.Is(err, esp.ErrSALifetime) {
+		r.Remove(session.inboundSPI)
+	}
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	return session, payload, next, nil
+}
+
+// SealBuffer keeps ownership with the caller on error and returns a datagram
+// owning buffer on success. No payload storage is allocated or copied.
+func (r *ESPRegistry) SealBuffer(session *Association, peer net.Addr, buffer *packetbuf.Buffer, next uint8) (ESPDatagram, error) {
+	if session == nil || session.owner != r || session.revoked.Load() {
+		return ESPDatagram{}, ErrUnknownESP
+	}
+	err := session.outbound.SealBuffer(buffer, next)
+	if errors.Is(err, esp.ErrSALifetime) {
+		r.Remove(session.inboundSPI)
+	}
+	if err != nil {
+		return ESPDatagram{}, err
+	}
+	return ESPDatagram{Payload: buffer.Bytes(), Peer: peer, NATT: session.encapsulation == isakmp.EncapsulationNATTTransport, Buffer: buffer}, nil
 }
 
 func (r *ESPRegistry) Cookie(session *Association) isakmp.Cookie {
