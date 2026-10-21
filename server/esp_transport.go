@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eukhlg/ipsec-go/protocol/esp"
@@ -108,17 +109,49 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 	}
 	queue := make(chan espDelivery, ESPDeliveryCapacity)
 	deliveryDone := make(chan struct{})
+	var callbackStarted atomic.Int64
 	var deliveryErr error // published by closing deliveryDone
 	go func() {
 		defer close(deliveryDone)
 		for item := range queue {
 			if ctx.Err() == nil {
+				callbackStarted.Store(time.Now().UnixNano())
 				if err := item.dispatch(ctx); err != nil {
 					deliveryErr = err
 					cancel()
 				}
+				callbackStarted.Store(0)
 			}
 			release(item.buffer)
+		}
+	}()
+	watchdogDone := make(chan struct{})
+	go func() {
+		defer close(watchdogDone)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		var fullSince, lastCallback, lastFull time.Time
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				if start := callbackStarted.Load(); start != 0 && now.Sub(time.Unix(0, start)) >= 100*time.Millisecond && now.Sub(lastCallback) >= 5*time.Second {
+					s.debug("esp delivery callback stalled duration=%s", now.Sub(time.Unix(0, start)))
+					lastCallback = now
+				}
+				if len(queue) == cap(queue) {
+					if fullSince.IsZero() {
+						fullSince = now
+					}
+					if now.Sub(fullSince) >= time.Second && now.Sub(lastFull) >= 5*time.Second {
+						s.debug("esp delivery FIFO full duration=%s capacity=%d", now.Sub(fullSince), cap(queue))
+						lastFull = now
+					}
+				} else {
+					fullSince = time.Time{}
+				}
+			}
 		}
 	}()
 	stopped := make(chan struct{})
@@ -138,6 +171,7 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 		close(queue)
 		<-deliveryDone
 		<-stopped
+		<-watchdogDone
 		if deliveryErr != nil {
 			serveErr = deliveryErr
 		} else if parent.Err() != nil {
