@@ -392,3 +392,51 @@ func (r *ESPRegistry) ReplayState(peer net.Addr, wire []byte) (esp.ReplayState, 
 	}
 	return session.inbound.ReplayState(binary.BigEndian.Uint32(wire[4:8])), true
 }
+
+// ESPReceive owns no storage: wire is borrowed until Commit returns and the
+// resulting application Dispatch has completed. One owner authenticates once.
+type ESPReceive struct {
+	registry    *ESPRegistry
+	association *Association
+	packet      *esp.ReceivePacket
+}
+
+// Precheck performs lookup and a read-only replay check. Removal does not erase
+// crypto keys; the retained association keeps its contexts live for workers.
+func (r *ESPRegistry) Precheck(peer net.Addr, wire []byte) (*ESPReceive, error) {
+	association, err := r.lookup(peer, wire)
+	if err != nil {
+		return nil, err
+	}
+	packet, err := association.inbound.Precheck(wire)
+	if err != nil {
+		return nil, err
+	}
+	return &ESPReceive{registry: r, association: association, packet: packet}, nil
+}
+func (p *ESPReceive) Authenticate() { p.packet.Authenticate() }
+
+// Commit excludes registry removal while checking identity and committing replay.
+// Callers must serialize this method in listener arrival order.
+func (p *ESPReceive) Commit() (*Association, []byte, uint8, error) {
+	r := p.registry
+	association := p.association
+	r.mu.RLock()
+	if r.inbound[association.inboundSPI] != association || !association.Active() {
+		r.mu.RUnlock()
+		return nil, nil, 0, ErrUnknownESP
+	}
+	payload, next, err := p.packet.Commit()
+	r.mu.RUnlock()
+	if errors.Is(err, esp.ErrSALifetime) {
+		r.mu.Lock()
+		if r.inbound[association.inboundSPI] == association {
+			r.removeLocked(association)
+		}
+		r.mu.Unlock()
+	}
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	return association, payload, next, nil
+}

@@ -20,6 +20,8 @@ type ESPPacketResult struct {
 	Datagrams []ESPDatagram
 	Dispatch  func(context.Context) error
 }
+type ESPDecryptedHandler func(context.Context, *Association, net.Addr, []byte, uint8, time.Time) (ESPPacketResult, error)
+
 type ESPPacketHandler func(context.Context, net.Addr, []byte, time.Time) (ESPPacketResult, error)
 
 // ESPDeliveryCapacity bounds pending borrowed packets per listener. Together
@@ -35,8 +37,11 @@ type ESPTransportServer struct {
 	closeMu sync.Mutex
 	closed  chan struct{}
 
-	Conn         net.PacketConn
-	HandlePacket ESPPacketHandler
+	// Registry and HandleDecrypted opt into phased receive. Legacy handlers remain supported.
+	Registry        *ESPRegistry
+	HandleDecrypted ESPDecryptedHandler
+	Conn            net.PacketConn
+	HandlePacket    ESPPacketHandler
 	// HandlePacketInPlace, when set, may mutate the owned receive buffer and
 	// borrow its data through Dispatch. It must not retain slices after Dispatch.
 	HandlePacketInPlace ESPPacketHandler
@@ -206,6 +211,20 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 	handler := s.HandlePacket
 	if s.HandlePacketInPlace != nil {
 		handler = s.HandlePacketInPlace
+	}
+	if s.Registry != nil && s.HandleDecrypted != nil {
+		handler = func(ctx context.Context, peer net.Addr, wire []byte, now time.Time) (ESPPacketResult, error) {
+			p, err := s.Registry.Precheck(peer, wire)
+			if err != nil {
+				return ESPPacketResult{}, err
+			}
+			p.Authenticate()
+			association, payload, next, err := p.Commit()
+			if err != nil {
+				return ESPPacketResult{}, err
+			}
+			return s.HandleDecrypted(ctx, association, peer, payload, next, now)
+		}
 	}
 	// The socket owns only this synchronous writable loan. Returned lengths
 	// bound erasure; ordinary Bytes exposure would conservatively dirty 64 KiB.
