@@ -30,8 +30,10 @@ func TestNATTBatchDemuxAndDispatchOwnership(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	count := 0
+	received := 0
 	s, _ := NewNATTServer(conn, func(_ context.Context, peer net.Addr, wire []byte, _ time.Time) (ESPPacketResult, error) {
-		expected := packets[3+count]
+		expected := packets[3+received]
+		received++
 		if peer.String() != tx.LocalAddr().String() || !bytes.Equal(wire, expected) {
 			t.Fatalf("wrong demultiplexed packet %v", wire)
 		}

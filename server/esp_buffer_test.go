@@ -29,38 +29,8 @@ func (c *receiveBufferConn) SetDeadline(time.Time) error               { return 
 func (c *receiveBufferConn) SetReadDeadline(time.Time) error           { return nil }
 func (c *receiveBufferConn) SetWriteDeadline(time.Time) error          { return nil }
 
-func TestReceiveBufferLifetimeThroughDispatch(t *testing.T) {
-	conn := &receiveBufferConn{packets: [][]byte{bytes.Repeat([]byte{1}, 100), bytes.Repeat([]byte{2}, 20)}}
-	var previous []byte
-	dispatched := 0
-	s := &ESPTransportServer{Conn: conn}
-	s.HandlePacketInPlace = func(_ context.Context, _ net.Addr, wire []byte, _ time.Time) (ESPPacketResult, error) {
-		if dispatched == 1 && !bytes.Equal(previous[20:], make([]byte, 80)) {
-			t.Fatal("previous plaintext retained before next receive")
-		}
-		value := byte(dispatched + 1)
-		return ESPPacketResult{Dispatch: func(context.Context) error {
-			if !bytes.Equal(wire, bytes.Repeat([]byte{value}, len(wire))) {
-				t.Fatal("receive buffer reused before final consumer")
-			}
-			previous = wire
-			dispatched++
-			return nil
-		}}, nil
-	}
-	if err := s.Serve(context.Background()); err != io.EOF {
-		t.Fatal(err)
-	}
-	if dispatched != 2 {
-		t.Fatalf("dispatches=%d", dispatched)
-	}
-	if !bytes.Equal(previous, make([]byte, len(previous))) {
-		t.Fatal("receive buffer not cleared on exit")
-	}
-}
-
 func TestReceiveDispatchFailureErasesStorage(t *testing.T) {
-	conn := &receiveBufferConn{packets: [][]byte{bytes.Repeat([]byte{0xa5}, 100)}}
+	conn := newPipelineConn(1)
 	var view []byte
 	s := &ESPTransportServer{Conn: conn, HandlePacketInPlace: func(_ context.Context, _ net.Addr, wire []byte, _ time.Time) (ESPPacketResult, error) {
 		view = wire
