@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"github.com/eukhlg/ipsec-go/packetbuf"
+	"github.com/eukhlg/netio/packetbuf"
 	"net"
 	"sync"
 	"sync/atomic"

@@ -23,7 +23,9 @@ Use `Seal` for replies, `Replacement` to follow a rekey, and `Cookie` or
 an `ESPPacketHandler`; its `Dispatch` callback runs after protocol replies are
 sent. Applications own the decrypted payload's protocol policy and session routing.
 
-This module does not depend on L2TP, PPP, TUN, TOML, or Docker. Its current
+Packet buffers and batched UDP I/O come from
+[netio](https://github.com/eukhlg/netio). This module does not depend on L2TP,
+PPP, TUN, TOML, or Docker. Its current
 negotiation policy is focused on the IKEv1 transport-mode use case; extraction
 does not add IKEv2, tunnel mode, or arbitrary traffic-selector support.
 

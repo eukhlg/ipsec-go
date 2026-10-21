@@ -9,8 +9,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/eukhlg/ipsec-go/packetbuf"
 	"github.com/eukhlg/ipsec-go/protocol/isakmp"
+	"github.com/eukhlg/netio/packetbuf"
 )
 
 // Independent reference MACs catch retained packet data and cross-SA key reuse.

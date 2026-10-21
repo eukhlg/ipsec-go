@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/eukhlg/ipsec-go/packetbuf"
 	"github.com/eukhlg/ipsec-go/protocol/isakmp"
+	"github.com/eukhlg/netio/packetbuf"
 )
 
 type Limits struct{ Packets, Bytes uint64 }
