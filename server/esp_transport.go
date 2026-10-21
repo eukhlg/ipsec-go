@@ -34,8 +34,11 @@ type espDelivery struct {
 }
 
 type ESPTransportServer struct {
-	closeMu sync.Mutex
-	closed  chan struct{}
+	// ReceiveWorkers >1 enables parallel crypto for the optional phased API.
+	// Zero and one retain the serial path. Configure before Serve.
+	ReceiveWorkers int
+	closeMu        sync.Mutex
+	closed         chan struct{}
 
 	// Registry and HandleDecrypted opt into phased receive. Legacy handlers remain supported.
 	Registry        *ESPRegistry
@@ -170,6 +173,7 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 		}
 		// Wake a pending socket read. The connection remains owned by the caller.
 		_ = s.Conn.SetReadDeadline(time.Now())
+		_ = s.Conn.SetWriteDeadline(time.Now())
 	}()
 	defer func() {
 		cancel()
@@ -226,6 +230,35 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 			return s.HandleDecrypted(ctx, association, peer, payload, next, now)
 		}
 	}
+	var receivingBuffer **packetbuf.Buffer
+	if s.Registry != nil && s.HandleDecrypted != nil && s.ReceiveWorkers > 1 {
+		pipeline := s.newReceivePipeline(ctx, cancel, release, func(item espDelivery) error {
+			select {
+			case queue <- item:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+		defer func() {
+			cancel()
+			pipeline.closeAndWait()
+			if err := pipeline.failure(); err != nil {
+				serveErr = err
+			}
+		}()
+		handler = func(ctx context.Context, peer net.Addr, wire []byte, now time.Time) (ESPPacketResult, error) {
+			p, err := s.Registry.Precheck(peer, wire)
+			if err != nil {
+				return ESPPacketResult{}, err
+			}
+			if err := pipeline.submit(p, peer, now, *receivingBuffer); err != nil {
+				return ESPPacketResult{}, err
+			}
+			*receivingBuffer = nil
+			return ESPPacketResult{}, nil
+		}
+	}
 	// The socket owns only this synchronous writable loan. Returned lengths
 	// bound erasure; ordinary Bytes exposure would conservatively dirty 64 KiB.
 	read := func(slots []packetbuf.ReceiveSlot) (int, error) {
@@ -269,6 +302,7 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 			if ctx.Err() != nil {
 				return nil
 			}
+			receivingBuffer = &buffers[i]
 			m := &messages[i]
 			if !m.Truncated && m.N >= 0 && m.N <= len(m.Payload) {
 				if processErr := s.processMessageDispatch(ctx, handler, m.Peer, m.Payload[:m.N:m.N], func(dispatch func(context.Context) error) error {
@@ -372,6 +406,10 @@ func (s *ESPTransportServer) processMessageDispatch(ctx context.Context, handler
 		s.debug("esp drop peer=%s natt=%t bytes=%d error=%v", peer, s.NATT, len(wire), err)
 		return nil
 	}
+	return s.deliverResult(ctx, result, deliver)
+}
+
+func (s *ESPTransportServer) deliverResult(ctx context.Context, result ESPPacketResult, deliver func(func(context.Context) error) error) error {
 	if err := func() error {
 		defer func() {
 			for _, reply := range result.Datagrams {
