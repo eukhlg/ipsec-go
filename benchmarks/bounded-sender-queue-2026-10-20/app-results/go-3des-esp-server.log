@@ -1,6 +1,0 @@
-2026/10/20 08:58:38 TUN routing enabled on bench0 (10.77.0.1/24)
-2026/10/20 08:58:38 IKEv1 listeners started on :500 and NAT-T :4500; server ID 172.29.231.2 force_natt=false replay_window=1024 lifetimes=8h/1h dpd=20s limits=1024/128/4
-2026/10/20 08:58:38 L2TP listener started on [::]:1701 (raw L2TP)
-2026/10/20 08:58:38 Client pool ready: subnet=10.77.0.0/24 server=10.77.0.1 range=10.77.0.2-10.77.0.11 users=1 limits=50/1/1
-2026/10/20 08:58:41 IPsec ESP SA established: peer=172.29.231.3:500 inbound_spi=e7e458c0 outbound_spi=c18b4d18
-2026/10/20 08:58:42 VPN client connected: user="bench" address=10.77.0.2 protocol=l2tp/ipsec peer=172.29.231.3:1701 tunnel=1 session=1
