@@ -37,8 +37,11 @@ type ESPTransportServer struct {
 	// ReceiveWorkers >1 enables parallel crypto for the optional phased API.
 	// Zero and one retain the serial path. Configure before Serve.
 	ReceiveWorkers int
-	closeMu        sync.Mutex
-	closed         chan struct{}
+	// UDPBatchSize bounds NAT-T receive batches. Zero uses the transport default.
+	// Configure before Serve; valid positive sizes are 1..256.
+	UDPBatchSize int
+	closeMu      sync.Mutex
+	closed       chan struct{}
 
 	// Registry and HandleDecrypted opt into phased receive. Legacy handlers remain supported.
 	Registry        *ESPRegistry
@@ -115,6 +118,14 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 	if s.Conn == nil || (s.HandlePacket == nil && s.HandlePacketInPlace == nil) {
 		return errors.New("esp transport server: missing connection or handler")
 	}
+	size := s.UDPBatchSize
+	if size == 0 {
+		size = udptransport.DefaultBatchSize
+	}
+	udp, err := udptransport.NewWithBatchSize(s.Conn, size)
+	if err != nil {
+		return err
+	}
 	queue := make(chan espDelivery, ESPDeliveryCapacity)
 	deliveryDone := make(chan struct{})
 	var callbackStarted atomic.Int64
@@ -188,8 +199,7 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 		}
 	}()
 
-	size := 1
-	udp := udptransport.New(s.Conn)
+	size = 1
 	if s.NATT {
 		size = udp.BatchSize()
 	}
