@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eukhlg/ipsec-go/protocol/esp"
@@ -19,6 +20,8 @@ type ESPPacketResult struct {
 	Datagrams []ESPDatagram
 	Dispatch  func(context.Context) error
 }
+type ESPDecryptedHandler func(context.Context, *Association, net.Addr, []byte, uint8, time.Time) (ESPPacketResult, error)
+
 type ESPPacketHandler func(context.Context, net.Addr, []byte, time.Time) (ESPPacketResult, error)
 
 // ESPDeliveryCapacity bounds pending borrowed packets per listener. Together
@@ -31,11 +34,17 @@ type espDelivery struct {
 }
 
 type ESPTransportServer struct {
-	closeMu sync.Mutex
-	closed  chan struct{}
+	// ReceiveWorkers >1 enables parallel crypto for the optional phased API.
+	// Zero and one retain the serial path. Configure before Serve.
+	ReceiveWorkers int
+	closeMu        sync.Mutex
+	closed         chan struct{}
 
-	Conn         net.PacketConn
-	HandlePacket ESPPacketHandler
+	// Registry and HandleDecrypted opt into phased receive. Legacy handlers remain supported.
+	Registry        *ESPRegistry
+	HandleDecrypted ESPDecryptedHandler
+	Conn            net.PacketConn
+	HandlePacket    ESPPacketHandler
 	// HandlePacketInPlace, when set, may mutate the owned receive buffer and
 	// borrow its data through Dispatch. It must not retain slices after Dispatch.
 	HandlePacketInPlace ESPPacketHandler
@@ -108,17 +117,49 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 	}
 	queue := make(chan espDelivery, ESPDeliveryCapacity)
 	deliveryDone := make(chan struct{})
+	var callbackStarted atomic.Int64
 	var deliveryErr error // published by closing deliveryDone
 	go func() {
 		defer close(deliveryDone)
 		for item := range queue {
 			if ctx.Err() == nil {
+				callbackStarted.Store(time.Now().UnixNano())
 				if err := item.dispatch(ctx); err != nil {
 					deliveryErr = err
 					cancel()
 				}
+				callbackStarted.Store(0)
 			}
 			release(item.buffer)
+		}
+	}()
+	watchdogDone := make(chan struct{})
+	go func() {
+		defer close(watchdogDone)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		var fullSince, lastCallback, lastFull time.Time
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				if start := callbackStarted.Load(); start != 0 && now.Sub(time.Unix(0, start)) >= 100*time.Millisecond && now.Sub(lastCallback) >= 5*time.Second {
+					s.debug("esp delivery callback stalled duration=%s", now.Sub(time.Unix(0, start)))
+					lastCallback = now
+				}
+				if len(queue) == cap(queue) {
+					if fullSince.IsZero() {
+						fullSince = now
+					}
+					if now.Sub(fullSince) >= time.Second && now.Sub(lastFull) >= 5*time.Second {
+						s.debug("esp delivery FIFO full duration=%s capacity=%d", now.Sub(fullSince), cap(queue))
+						lastFull = now
+					}
+				} else {
+					fullSince = time.Time{}
+				}
+			}
 		}
 	}()
 	stopped := make(chan struct{})
@@ -132,12 +173,14 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 		}
 		// Wake a pending socket read. The connection remains owned by the caller.
 		_ = s.Conn.SetReadDeadline(time.Now())
+		_ = s.Conn.SetWriteDeadline(time.Now())
 	}()
 	defer func() {
 		cancel()
 		close(queue)
 		<-deliveryDone
 		<-stopped
+		<-watchdogDone
 		if deliveryErr != nil {
 			serveErr = deliveryErr
 		} else if parent.Err() != nil {
@@ -172,6 +215,49 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 	handler := s.HandlePacket
 	if s.HandlePacketInPlace != nil {
 		handler = s.HandlePacketInPlace
+	}
+	if s.Registry != nil && s.HandleDecrypted != nil {
+		handler = func(ctx context.Context, peer net.Addr, wire []byte, now time.Time) (ESPPacketResult, error) {
+			p, err := s.Registry.Precheck(peer, wire)
+			if err != nil {
+				return ESPPacketResult{}, err
+			}
+			p.Authenticate()
+			association, payload, next, err := p.Commit()
+			if err != nil {
+				return ESPPacketResult{}, err
+			}
+			return s.HandleDecrypted(ctx, association, peer, payload, next, now)
+		}
+	}
+	var receivingBuffer **packetbuf.Buffer
+	if s.Registry != nil && s.HandleDecrypted != nil && s.ReceiveWorkers > 1 {
+		pipeline := s.newReceivePipeline(ctx, cancel, release, func(item espDelivery) error {
+			select {
+			case queue <- item:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+		defer func() {
+			cancel()
+			pipeline.closeAndWait()
+			if err := pipeline.failure(); err != nil {
+				serveErr = err
+			}
+		}()
+		handler = func(ctx context.Context, peer net.Addr, wire []byte, now time.Time) (ESPPacketResult, error) {
+			p, err := s.Registry.Precheck(peer, wire)
+			if err != nil {
+				return ESPPacketResult{}, err
+			}
+			if err := pipeline.submit(p, peer, now, *receivingBuffer); err != nil {
+				return ESPPacketResult{}, err
+			}
+			*receivingBuffer = nil
+			return ESPPacketResult{}, nil
+		}
 	}
 	// The socket owns only this synchronous writable loan. Returned lengths
 	// bound erasure; ordinary Bytes exposure would conservatively dirty 64 KiB.
@@ -216,6 +302,7 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 			if ctx.Err() != nil {
 				return nil
 			}
+			receivingBuffer = &buffers[i]
 			m := &messages[i]
 			if !m.Truncated && m.N >= 0 && m.N <= len(m.Payload) {
 				if processErr := s.processMessageDispatch(ctx, handler, m.Peer, m.Payload[:m.N:m.N], func(dispatch func(context.Context) error) error {
@@ -319,6 +406,10 @@ func (s *ESPTransportServer) processMessageDispatch(ctx context.Context, handler
 		s.debug("esp drop peer=%s natt=%t bytes=%d error=%v", peer, s.NATT, len(wire), err)
 		return nil
 	}
+	return s.deliverResult(ctx, result, deliver)
+}
+
+func (s *ESPTransportServer) deliverResult(ctx context.Context, result ESPPacketResult, deliver func(func(context.Context) error) error) error {
 	if err := func() error {
 		defer func() {
 			for _, reply := range result.Datagrams {

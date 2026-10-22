@@ -40,6 +40,7 @@ type cbcMode interface {
 }
 
 type SA struct {
+	cryptoPool       sync.Pool
 	mu               sync.Mutex
 	spi              uint32
 	block            cipher.Block
@@ -87,7 +88,12 @@ func NewSA(config SAConfig) (*SA, error) {
 	var iv [aes.BlockSize]byte
 	encrypt := cipher.NewCBCEncrypter(block, iv[:block.BlockSize()]).(cbcMode)
 	decrypt := cipher.NewCBCDecrypter(block, iv[:block.BlockSize()]).(cbcMode)
-	return &SA{encrypt: encrypt, decrypt: decrypt, replay: replay, spi: config.SPI, block: block, mac: hmac.New(sha1.New, config.AuthenticationKey), random: config.Random, limits: config.Limits, lifetime: config.Lifetime, created: config.Now(), now: config.Now}, nil
+	s := &SA{encrypt: encrypt, decrypt: decrypt, replay: replay, spi: config.SPI, block: block, mac: hmac.New(sha1.New, config.AuthenticationKey), random: config.Random, limits: config.Limits, lifetime: config.Lifetime, created: config.Now(), now: config.Now}
+	authKey := append([]byte(nil), config.AuthenticationKey...)
+	s.cryptoPool.New = func() any {
+		return &receiveCrypto{mac: hmac.New(sha1.New, authKey), decrypt: cipher.NewCBCDecrypter(block, make([]byte, block.BlockSize())).(cbcMode)}
+	}
+	return s, nil
 }
 
 func (s *SA) SPI() uint32 { return s.spi }
@@ -166,46 +172,106 @@ func (s *SA) Open(wire []byte) ([]byte, uint8, error) {
 // wire and is valid only while its owner retains that storage. Failure may leave
 // decrypted bytes in wire; the owner must clear storage before pooling it.
 func (s *SA) OpenInPlace(wire []byte) ([]byte, uint8, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	packet, err := DecodePacketView(wire, s.block.BlockSize(), ICVSizeHMACSHA196)
+	p, err := s.Precheck(wire)
 	if err != nil {
 		return nil, 0, err
 	}
+	p.Authenticate()
+	return p.Commit()
+}
+
+type receiveCrypto struct {
+	mac     hash.Hash
+	decrypt cbcMode
+	icv     [sha1.Size]byte
+}
+
+// ReceivePacket borrows wire through Commit. One owner calls Authenticate once,
+// then Commit once; callers may process different packets concurrently. Commit
+// ordering is the caller's responsibility. No replay state changes before Commit.
+type ReceivePacket struct {
+	sa            *SA
+	packet        Packet
+	wire, payload []byte
+	next          uint8
+	err           error
+	authenticated bool
+}
+
+// Precheck decodes and checks replay eligibility without changing the window.
+func (s *SA) Precheck(wire []byte) (*ReceivePacket, error) {
+	packet, err := DecodePacketView(wire, s.block.BlockSize(), ICVSizeHMACSHA196)
+	if err != nil {
+		return nil, err
+	}
 	if packet.SPI != s.spi {
-		return nil, 0, ErrInvalidPacket
+		return nil, ErrInvalidPacket
 	}
-	if err = s.replay.Check(packet.Sequence); err != nil {
-		return nil, 0, err
+	s.mu.Lock()
+	err = s.replay.Check(packet.Sequence)
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
 	}
-	want := s.calculateICV(wire[:len(wire)-ICVSizeHMACSHA196])
-	if subtle.ConstantTimeCompare(want, packet.ICV) != 1 {
-		return nil, 0, ErrAuthentication
+	return &ReceivePacket{sa: s, packet: packet, wire: wire}, nil
+}
+
+// Authenticate checks the constant-time ICV before any in-place decryption.
+// Keyed state belongs exclusively to this invocation, including within one SA.
+func (p *ReceivePacket) Authenticate() {
+	c := p.sa.cryptoPool.Get().(*receiveCrypto)
+	defer p.sa.cryptoPool.Put(c)
+	c.mac.Reset()
+	_, _ = c.mac.Write(p.wire[:len(p.wire)-ICVSizeHMACSHA196])
+	want := c.mac.Sum(c.icv[:0])[:ICVSizeHMACSHA196]
+	if subtle.ConstantTimeCompare(want, p.packet.ICV) != 1 {
+		p.err = ErrAuthentication
+		return
 	}
-	plain := packet.Ciphertext
-	s.decrypt.SetIV(packet.IV)
-	s.decrypt.CryptBlocks(plain, plain)
+	p.authenticated = true
+	plain := p.packet.Ciphertext
+	c.decrypt.SetIV(p.packet.IV)
+	c.decrypt.CryptBlocks(plain, plain)
 	padLength := int(plain[len(plain)-2])
 	if padLength+2 > len(plain) {
-		return nil, 0, ErrInvalidPacket
+		p.err = ErrInvalidPacket
+		return
 	}
 	padStart := len(plain) - 2 - padLength
 	for i := 0; i < padLength; i++ {
 		if plain[padStart+i] != byte(i+1) {
-			return nil, 0, ErrInvalidPacket
+			p.err = ErrInvalidPacket
+			return
 		}
 	}
-	payload := plain[:padStart:padStart]
-	next := plain[len(plain)-1]
-	if err = s.checkLifetime(uint64(len(payload))); err != nil {
+	p.payload = plain[:padStart:padStart]
+	p.next = plain[len(plain)-1]
+}
+
+// Commit rechecks replay and lifetime under the SA lock. Authentication and
+// padding failures never consume sequence numbers or lifetime accounting.
+func (p *ReceivePacket) Commit() ([]byte, uint8, error) {
+	s := p.sa
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.replay.Check(p.packet.Sequence); err != nil {
 		return nil, 0, err
 	}
-	if err = s.replay.Accept(packet.Sequence); err != nil {
+	if p.err != nil {
+		return nil, 0, p.err
+	}
+	if !p.authenticated {
+		return nil, 0, ErrAuthentication
+	}
+	if err := s.checkLifetime(uint64(len(p.payload))); err != nil {
+		return nil, 0, err
+	}
+	if err := s.replay.Accept(p.packet.Sequence); err != nil {
 		return nil, 0, err
 	}
 	s.packets++
-	s.bytes += uint64(len(payload))
-	return payload, next, nil
+	s.bytes += uint64(len(p.payload))
+	return p.payload, p.next, nil
 }
 
 func (s *SA) checkLifetime(nextBytes uint64) error {
