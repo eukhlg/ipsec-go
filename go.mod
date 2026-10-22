@@ -2,7 +2,7 @@ module github.com/eukhlg/ipsec-go
 
 go 1.25
 
-require github.com/eukhlg/netio v0.0.0-20261021135112-192b7a1678cd
+require github.com/eukhlg/netio v0.0.0-20261022140448-ab1e241f0ce6
 
 require (
 	golang.org/x/net v0.47.0 // indirect
