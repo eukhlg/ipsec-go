@@ -107,12 +107,12 @@ func (p *espReceivePipeline) finish(w *espReceiveWork) {
 	}
 	association, payload, next, err := w.packet.Commit()
 	if err != nil {
-		p.server.debug("esp commit drop peer=%s error=%v", w.peer, err)
+		p.server.debugDrop("esp commit drop", w.peer, err, "esp commit drop peer=%s error=%v", w.peer, err)
 		return
 	}
 	result, err := p.server.HandleDecrypted(p.ctx, association, w.peer, payload, next, w.now)
 	if err != nil {
-		p.server.debug("esp plaintext drop peer=%s error=%v", w.peer, err)
+		p.server.debugDrop("esp plaintext drop", w.peer, err, "esp plaintext drop peer=%s error=%v", w.peer, err)
 		return
 	}
 	if err = p.server.deliverResult(p.ctx, result, func(dispatch func(context.Context) error) error {
