@@ -49,6 +49,108 @@ type ESPRegistry struct {
 	bySPI            map[uint32]*Association
 	byIKE            map[isakmp.Cookie]map[*Association]struct{}
 	latest           map[isakmp.Cookie]*Association
+	onRemove         atomic.Pointer[func(RemoveEvent)]
+}
+
+// RemoveReason says why an association left the registry.
+type RemoveReason uint8
+
+const (
+	// RemoveExplicit is a caller's Remove(spi).
+	RemoveExplicit RemoveReason = iota + 1
+	// RemoveIKE is RemoveIKE, normally an IKE delete or expiry.
+	RemoveIKE
+	// RemoveSPIReuse is Install displacing an association that used the same SPI.
+	RemoveSPIReuse
+	// RemoveLifetime is a negotiated time, packet or byte limit being reached.
+	RemoveLifetime
+	// RemoveClose is the registry shutting down.
+	RemoveClose
+)
+
+func (r RemoveReason) String() string {
+	switch r {
+	case RemoveExplicit:
+		return "explicit"
+	case RemoveIKE:
+		return "ike"
+	case RemoveSPIReuse:
+		return "spi-reuse"
+	case RemoveLifetime:
+		return "lifetime"
+	case RemoveClose:
+		return "close"
+	default:
+		return "unknown"
+	}
+}
+
+// RemoveDirection identifies the traffic direction that reached an SA limit.
+type RemoveDirection uint8
+
+const (
+	RemoveDirectionNone RemoveDirection = iota
+	RemoveDirectionInbound
+	RemoveDirectionOutbound
+)
+
+func (d RemoveDirection) String() string {
+	switch d {
+	case RemoveDirectionInbound:
+		return "inbound"
+	case RemoveDirectionOutbound:
+		return "outbound"
+	default:
+		return "none"
+	}
+}
+
+// RemoveEvent describes one association leaving the registry. Direction and
+// Lifetime are set only for RemoveLifetime. Peer is a copy.
+type RemoveEvent struct {
+	Reason                  RemoveReason
+	Direction               RemoveDirection
+	Lifetime                *esp.LifetimeError
+	InboundSPI, OutboundSPI uint32
+	Peer                    net.Addr
+	IKECookie               isakmp.Cookie
+}
+
+// SetRemoveHandler installs a callback invoked once for every association that
+// leaves the registry, after registry locks are released. It may be called
+// concurrently from receive, send and lifecycle goroutines and must not block.
+// A nil handler disables notification. Safe to call at any time.
+func (r *ESPRegistry) SetRemoveHandler(handler func(RemoveEvent)) {
+	if handler == nil {
+		r.onRemove.Store(nil)
+		return
+	}
+	r.onRemove.Store(&handler)
+}
+
+func (r *ESPRegistry) notify(events []RemoveEvent) {
+	handler := r.onRemove.Load()
+	if handler == nil {
+		return
+	}
+	for _, event := range events {
+		(*handler)(event)
+	}
+}
+
+// removeExpired removes an association that reached a negotiated limit, unless
+// it was already removed or replaced, and reports why. Callers hold no locks.
+func (r *ESPRegistry) removeExpired(session *Association, err error, direction RemoveDirection) {
+	r.mu.Lock()
+	if r.bySPI[session.inboundSPI] != session {
+		r.mu.Unlock()
+		return
+	}
+	event := r.removeLocked(session, RemoveLifetime)
+	r.mu.Unlock()
+	event.Direction = direction
+	errors.As(err, &event.Lifetime)
+	r.notify([]RemoveEvent{event})
 }
 
 func NewESPRegistry() *ESPRegistry {
@@ -91,16 +193,20 @@ func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
 		return err
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	var events []RemoveEvent
+	defer func() {
+		r.mu.Unlock()
+		r.notify(events)
+	}()
 	session := &Association{owner: r, peerIP: append(net.IP(nil), ip...), peer: clonePeer(peer), inbound: inbound, outbound: outbound, encapsulation: pair.Transform.Encapsulation, inboundSPI: pair.Inbound.SPI, outboundSPI: pair.Outbound.SPI, ikeCookie: pair.ResponderCookie}
 	if lifetime > 0 {
 		session.expiresAt = time.Now().Add(lifetime)
 	}
 	if old := r.bySPI[pair.Inbound.SPI]; old != nil {
-		r.removeLocked(old)
+		events = append(events, r.removeLocked(old, RemoveSPIReuse))
 	}
 	if old := r.bySPI[pair.Outbound.SPI]; old != nil {
-		r.removeLocked(old)
+		events = append(events, r.removeLocked(old, RemoveSPIReuse))
 	}
 	r.inbound[pair.Inbound.SPI] = session
 	r.bySPI[pair.Inbound.SPI], r.bySPI[pair.Outbound.SPI] = session, session
@@ -135,20 +241,24 @@ func (r *ESPRegistry) lookup(peer net.Addr, wire []byte) (*Association, error) {
 }
 
 func (r *ESPRegistry) Remove(spi uint32) {
+	var events []RemoveEvent
 	r.mu.Lock()
 	if session := r.bySPI[spi]; session != nil {
-		r.removeLocked(session)
+		events = append(events, r.removeLocked(session, RemoveExplicit))
 	}
 	r.mu.Unlock()
+	r.notify(events)
 }
 
 func (r *ESPRegistry) RemoveIKE(cookie isakmp.Cookie) {
+	var events []RemoveEvent
 	r.mu.Lock()
 	for session := range r.byIKE[cookie] {
-		r.removeLocked(session)
+		events = append(events, r.removeLocked(session, RemoveIKE))
 	}
 	delete(r.byIKE, cookie)
 	r.mu.Unlock()
+	r.notify(events)
 }
 
 // RebindIKE transfers live child SAs to a replacement IKE SA without
@@ -180,18 +290,28 @@ func (r *ESPRegistry) RebindIKE(from, to isakmp.Cookie) {
 }
 
 func (r *ESPRegistry) Close() {
+	var events []RemoveEvent
 	r.mu.Lock()
 	for _, session := range r.inbound {
 		session.revoked.Store(true)
+		events = append(events, removeEvent(session, RemoveClose))
 	}
 	r.inbound = make(map[uint32]*Association)
 	r.bySPI = make(map[uint32]*Association)
 	r.byIKE = make(map[isakmp.Cookie]map[*Association]struct{})
 	r.latest = make(map[isakmp.Cookie]*Association)
 	r.mu.Unlock()
+	r.notify(events)
 }
 
-func (r *ESPRegistry) removeLocked(session *Association) {
+func removeEvent(session *Association, reason RemoveReason) RemoveEvent {
+	return RemoveEvent{Reason: reason, InboundSPI: session.inboundSPI, OutboundSPI: session.outboundSPI, Peer: clonePeer(session.peer), IKECookie: session.ikeCookie}
+}
+
+// removeLocked revokes and unlinks session and returns the event to report
+// once the caller has released r.mu.
+func (r *ESPRegistry) removeLocked(session *Association, reason RemoveReason) RemoveEvent {
+	event := removeEvent(session, reason)
 	session.revoked.Store(true)
 	delete(r.inbound, session.inboundSPI)
 	delete(r.bySPI, session.inboundSPI)
@@ -210,6 +330,7 @@ func (r *ESPRegistry) removeLocked(session *Association) {
 			}
 		}
 	}
+	return event
 }
 
 // Replacement returns the newest live child SA belonging to the same IKE SA.
@@ -261,7 +382,7 @@ func (r *ESPRegistry) Open(peer net.Addr, wire []byte) (*Association, []byte, ui
 	}
 	payload, next, err := session.inbound.Open(wire)
 	if errors.Is(err, esp.ErrSALifetime) {
-		r.Remove(session.inboundSPI)
+		r.removeExpired(session, err, RemoveDirectionInbound)
 	}
 	if err != nil {
 		return nil, nil, 0, err
@@ -277,7 +398,7 @@ func (r *ESPRegistry) Seal(session *Association, peer net.Addr, payload []byte, 
 	}
 	wire, err := session.outbound.Seal(payload, next)
 	if errors.Is(err, esp.ErrSALifetime) {
-		r.Remove(session.inboundSPI)
+		r.removeExpired(session, err, RemoveDirectionOutbound)
 	}
 	if err != nil {
 		return ESPDatagram{}, err
@@ -293,7 +414,7 @@ func (r *ESPRegistry) OpenInPlace(peer net.Addr, wire []byte) (*Association, []b
 	}
 	payload, next, err := session.inbound.OpenInPlace(wire)
 	if errors.Is(err, esp.ErrSALifetime) {
-		r.Remove(session.inboundSPI)
+		r.removeExpired(session, err, RemoveDirectionInbound)
 	}
 	if err != nil {
 		return nil, nil, 0, err
@@ -309,7 +430,7 @@ func (r *ESPRegistry) SealBuffer(session *Association, peer net.Addr, buffer *pa
 	}
 	err := session.outbound.SealBuffer(buffer, next)
 	if errors.Is(err, esp.ErrSALifetime) {
-		r.Remove(session.inboundSPI)
+		r.removeExpired(session, err, RemoveDirectionOutbound)
 	}
 	if err != nil {
 		return ESPDatagram{}, err
@@ -429,11 +550,7 @@ func (p *ESPReceive) Commit() (*Association, []byte, uint8, error) {
 	payload, next, err := p.packet.Commit()
 	r.mu.RUnlock()
 	if errors.Is(err, esp.ErrSALifetime) {
-		r.mu.Lock()
-		if r.inbound[association.inboundSPI] == association {
-			r.removeLocked(association)
-		}
-		r.mu.Unlock()
+		r.removeExpired(association, err, RemoveDirectionInbound)
 	}
 	if err != nil {
 		return nil, nil, 0, err

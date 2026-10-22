@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"time"
 )
 
 const (
@@ -20,6 +21,51 @@ var (
 	ErrSequenceExhausted = errors.New("esp: sequence space exhausted")
 	ErrSALifetime        = errors.New("esp: security association lifetime exceeded")
 )
+
+// LifetimeReason identifies which negotiated security association limit was reached.
+type LifetimeReason uint8
+
+const (
+	LifetimeTime LifetimeReason = iota + 1
+	LifetimePackets
+	LifetimeBytes
+)
+
+func (r LifetimeReason) String() string {
+	switch r {
+	case LifetimeTime:
+		return "time"
+	case LifetimePackets:
+		return "packets"
+	case LifetimeBytes:
+		return "bytes"
+	default:
+		return "unknown"
+	}
+}
+
+// LifetimeError reports an exhausted security association limit. It matches
+// ErrSALifetime with errors.Is, so existing callers keep working unchanged.
+// Packets and Bytes are the counters before the rejected packet. Limit is the
+// packet or byte limit (zero for time); Age is set for time expiry.
+type LifetimeError struct {
+	SPI            uint32
+	Reason         LifetimeReason
+	Packets, Bytes uint64
+	Limit          uint64
+	Lifetime, Age  time.Duration
+}
+
+func (e *LifetimeError) Error() string {
+	switch e.Reason {
+	case LifetimeTime:
+		return fmt.Sprintf("%v: spi=%08x reason=time age=%s lifetime=%s", ErrSALifetime, e.SPI, e.Age, e.Lifetime)
+	default:
+		return fmt.Sprintf("%v: spi=%08x reason=%s packets=%d bytes=%d limit=%d", ErrSALifetime, e.SPI, e.Reason, e.Packets, e.Bytes, e.Limit)
+	}
+}
+
+func (e *LifetimeError) Is(target error) bool { return target == ErrSALifetime }
 
 type Packet struct {
 	SPI        uint32

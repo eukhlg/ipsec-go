@@ -275,16 +275,24 @@ func (p *ReceivePacket) Commit() ([]byte, uint8, error) {
 }
 
 func (s *SA) checkLifetime(nextBytes uint64) error {
-	if s.lifetime > 0 && s.now().Sub(s.created) >= s.lifetime {
-		return ErrSALifetime
+	if s.lifetime > 0 {
+		if age := s.now().Sub(s.created); age >= s.lifetime {
+			return s.lifetimeError(LifetimeTime, 0, age)
+		}
 	}
 	if s.limits.Packets != 0 && s.packets >= s.limits.Packets {
-		return ErrSALifetime
+		return s.lifetimeError(LifetimePackets, s.limits.Packets, 0)
 	}
 	if s.limits.Bytes != 0 && (nextBytes > s.limits.Bytes || s.bytes > s.limits.Bytes-nextBytes) {
-		return ErrSALifetime
+		return s.lifetimeError(LifetimeBytes, s.limits.Bytes, 0)
 	}
 	return nil
+}
+
+// lifetimeError is only reached once per exhausted SA in practice, so the
+// allocation is off the per-packet path. Callers hold s.mu.
+func (s *SA) lifetimeError(reason LifetimeReason, limit uint64, age time.Duration) error {
+	return &LifetimeError{SPI: s.spi, Reason: reason, Packets: s.packets, Bytes: s.bytes, Limit: limit, Lifetime: s.lifetime, Age: age}
 }
 
 // calculateICV reuses keyed state and digest storage under s.mu. The result is
