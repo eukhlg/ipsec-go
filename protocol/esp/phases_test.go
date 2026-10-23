@@ -3,6 +3,7 @@ package esp
 import (
 	"bytes"
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"github.com/eukhlg/ipsec-go/protocol/isakmp"
 	"math/rand"
@@ -103,11 +104,20 @@ func TestPhasedLegacyEquivalence(t *testing.T) {
 					}
 					p1, n1, e1 := a.OpenInPlace(w1)
 					p2, n2, e2 := b.legacyOpenInPlace(w2)
-					if e1 != e2 || n1 != n2 || !bytes.Equal(p1, p2) || !bytes.Equal(w1, w2) || a.packets != b.packets || a.bytes != b.bytes {
+					if !sameError(e1, e2) || n1 != n2 || !bytes.Equal(p1, p2) || !bytes.Equal(w1, w2) || a.packets != b.packets || a.bytes != b.bytes {
 						t.Fatalf("iteration %d: phased=%v legacy=%v", i, e1, e2)
 					}
 				}
 			})
 		}
 	}
+}
+
+// sameError treats lifetime errors as equal when they report the same limit;
+// they are distinct values carrying counters rather than a shared sentinel.
+func sameError(a, b error) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a == b || (errors.Is(a, ErrSALifetime) && errors.Is(b, ErrSALifetime) && a.Error() == b.Error())
 }

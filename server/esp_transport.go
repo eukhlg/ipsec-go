@@ -56,6 +56,7 @@ type ESPTransportServer struct {
 	Established         IKEEstablishedHandler
 	Lifecycle           IKELifecycleHandler
 	Debugf              func(string, ...any)
+	drops               dropLimiter
 	Tracef              func(string, ...any)
 }
 
@@ -413,7 +414,7 @@ func (s *ESPTransportServer) processMessageDispatch(ctx context.Context, handler
 	}
 	result, err := handler(ctx, peer, wire, time.Now())
 	if err != nil {
-		s.debug("esp drop peer=%s natt=%t bytes=%d error=%v", peer, s.NATT, len(wire), err)
+		s.debugDrop("esp drop", peer, err, "esp drop peer=%s natt=%t bytes=%d error=%v", peer, s.NATT, len(wire), err)
 		return nil
 	}
 	return s.deliverResult(ctx, result, deliver)
