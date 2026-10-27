@@ -287,3 +287,45 @@ func TestESPPipelineBackpressureResumesWithoutLoss(t *testing.T) {
 	}
 	pool.check()
 }
+
+func TestDeliveryFlushRetainsBuffersAndDoesNotWaitForTraffic(t *testing.T) {
+	c := newPipelineConn(3)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &ESPTransportServer{Conn: c}
+	var pending [][]byte
+	flushed := 0
+	s.NewDeliveryBatch = func(ctx context.Context) (context.Context, func() error) {
+		return ctx, func() error {
+			for _, v := range pending {
+				if binary.BigEndian.Uint32(v) == 0 {
+					t.Error("buffer released before flush")
+				}
+			}
+			flushed += len(pending)
+			pending = nil
+			if flushed == 3 {
+				cancel()
+			}
+			return nil
+		}
+	}
+	s.HandlePacketInPlace = func(_ context.Context, _ net.Addr, wire []byte, _ time.Time) (ESPPacketResult, error) {
+		return ESPPacketResult{Dispatch: func(ctx context.Context) error {
+			b := DeliveryBuffer(ctx)
+			if b == nil || &b.Bytes()[0] != &wire[0] {
+				t.Error("delivery owner missing or copied")
+			}
+			pending = append(pending, wire)
+			return nil
+		}}, nil
+	}
+	pool := newCountedPipelinePool(t)
+	if err := s.serve(ctx, pool.acquire, pool.release); err != nil {
+		t.Fatal(err)
+	}
+	pool.check()
+	if flushed != 3 {
+		t.Fatalf("flushed=%d", flushed)
+	}
+}

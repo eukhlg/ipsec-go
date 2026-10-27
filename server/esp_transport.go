@@ -37,6 +37,9 @@ type ESPTransportServer struct {
 	// ReceiveWorkers >1 enables parallel crypto for the optional phased API.
 	// Zero and one retain the serial path. Configure before Serve.
 	ReceiveWorkers int
+	// NewDeliveryBatch creates per-delivery-goroutine state. Its flush runs
+	// after every bounded FIFO drain, before buffers are released or we block.
+	NewDeliveryBatch func(context.Context) (context.Context, func() error)
 	// UDPBatchSize bounds NAT-T receive batches. Zero uses the transport default.
 	// Configure before Serve; valid positive sizes are 1..256.
 	UDPBatchSize int
@@ -133,18 +136,53 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 	var deliveryErr error // published by closing deliveryDone
 	go func() {
 		defer close(deliveryDone)
-		for item := range queue {
-			if ctx.Err() == nil {
-				callbackStarted.Store(time.Now().UnixNano())
-				if err := item.dispatch(ctx); err != nil {
-					deliveryErr = err
-					cancel()
+		// One context value per delivery goroutine; its slot is updated per
+		// packet, so dispatch allocates nothing per packet.
+		current := &deliveryBufferSlot{}
+		deliveryCtx := context.WithValue(ctx, deliveryBufferKey{}, current)
+		flush := func() error { return nil }
+		if s.NewDeliveryBatch != nil {
+			deliveryCtx, flush = s.NewDeliveryBatch(deliveryCtx)
+		}
+		batch := make([]espDelivery, 0, ESPDeliveryCapacity)
+		for first := range queue {
+			batch = append(batch[:0], first)
+		drain:
+			for s.NewDeliveryBatch != nil && len(batch) < ESPDeliveryCapacity {
+				select {
+				case item, ok := <-queue:
+					if !ok {
+						break drain
+					}
+					batch = append(batch, item)
+				default:
+					break drain
 				}
-				callbackStarted.Store(0)
 			}
-			release(item.buffer)
+			callbackStarted.Store(time.Now().UnixNano())
+			for _, item := range batch {
+				if ctx.Err() == nil {
+					current.buffer = item.buffer
+					err := item.dispatch(deliveryCtx)
+					current.buffer = nil
+					if err != nil {
+						deliveryErr = err
+						cancel()
+					}
+				}
+			}
+			if err := flush(); err != nil {
+				deliveryErr = err
+				cancel()
+			}
+			callbackStarted.Store(0)
+			for i := range batch {
+				release(batch[i].buffer)
+				batch[i] = espDelivery{}
+			}
 		}
 	}()
+
 	watchdogDone := make(chan struct{})
 	go func() {
 		defer close(watchdogDone)
@@ -480,4 +518,20 @@ func (s *ESPTransportServer) Close() error {
 		return nil
 	}
 	return s.Conn.Close()
+}
+
+type deliveryBufferKey struct{}
+
+// deliveryBufferSlot holds the buffer of the packet being dispatched. It is
+// owned by one delivery goroutine and only read synchronously during Dispatch.
+type deliveryBufferSlot struct{ buffer *packetbuf.Buffer }
+
+// DeliveryBuffer returns the driver-owned buffer during Dispatch. Callbacks
+// may borrow it until the current delivery batch flush finishes, never release it.
+func DeliveryBuffer(ctx context.Context) *packetbuf.Buffer {
+	slot, _ := ctx.Value(deliveryBufferKey{}).(*deliveryBufferSlot)
+	if slot == nil {
+		return nil
+	}
+	return slot.buffer
 }
