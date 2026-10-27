@@ -136,10 +136,13 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 	var deliveryErr error // published by closing deliveryDone
 	go func() {
 		defer close(deliveryDone)
-		deliveryCtx := ctx
+		// One context value per delivery goroutine; its slot is updated per
+		// packet, so dispatch allocates nothing per packet.
+		current := &deliveryBufferSlot{}
+		deliveryCtx := context.WithValue(ctx, deliveryBufferKey{}, current)
 		flush := func() error { return nil }
 		if s.NewDeliveryBatch != nil {
-			deliveryCtx, flush = s.NewDeliveryBatch(ctx)
+			deliveryCtx, flush = s.NewDeliveryBatch(deliveryCtx)
 		}
 		batch := make([]espDelivery, 0, ESPDeliveryCapacity)
 		for first := range queue {
@@ -159,11 +162,10 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 			callbackStarted.Store(time.Now().UnixNano())
 			for _, item := range batch {
 				if ctx.Err() == nil {
-					callbackCtx := deliveryCtx
-					if item.buffer != nil {
-						callbackCtx = context.WithValue(callbackCtx, deliveryBufferKey{}, item.buffer)
-					}
-					if err := item.dispatch(callbackCtx); err != nil {
+					current.buffer = item.buffer
+					err := item.dispatch(deliveryCtx)
+					current.buffer = nil
+					if err != nil {
 						deliveryErr = err
 						cancel()
 					}
@@ -520,9 +522,16 @@ func (s *ESPTransportServer) Close() error {
 
 type deliveryBufferKey struct{}
 
+// deliveryBufferSlot holds the buffer of the packet being dispatched. It is
+// owned by one delivery goroutine and only read synchronously during Dispatch.
+type deliveryBufferSlot struct{ buffer *packetbuf.Buffer }
+
 // DeliveryBuffer returns the driver-owned buffer during Dispatch. Callbacks
 // may borrow it until the current delivery batch flush finishes, never release it.
 func DeliveryBuffer(ctx context.Context) *packetbuf.Buffer {
-	b, _ := ctx.Value(deliveryBufferKey{}).(*packetbuf.Buffer)
-	return b
+	slot, _ := ctx.Value(deliveryBufferKey{}).(*deliveryBufferSlot)
+	if slot == nil {
+		return nil
+	}
+	return slot.buffer
 }
