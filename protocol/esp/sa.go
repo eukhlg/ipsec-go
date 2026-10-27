@@ -40,22 +40,21 @@ type cbcMode interface {
 }
 
 type SA struct {
-	cryptoPool       sync.Pool
-	mu               sync.Mutex
-	spi              uint32
-	block            cipher.Block
-	encrypt, decrypt cbcMode
-	sealIV           [aes.BlockSize]byte
-	mac              hash.Hash
-	icv              [sha1.Size]byte
-	random           io.Reader
-	sequence         uint32
-	replay           ReplayWindow
-	packets, bytes   uint64
-	limits           Limits
-	lifetime         time.Duration
-	created          time.Time
-	now              func() time.Time
+	cryptoPool     sync.Pool
+	sealPool       sync.Pool
+	mu             sync.Mutex
+	spi            uint32
+	block          cipher.Block
+	decrypt        cbcMode
+	sealIV         [aes.BlockSize]byte
+	random         io.Reader
+	sequence       uint32
+	replay         ReplayWindow
+	packets, bytes uint64
+	limits         Limits
+	lifetime       time.Duration
+	created        time.Time
+	now            func() time.Time
 }
 
 func NewSA(config SAConfig) (*SA, error) {
@@ -86,12 +85,14 @@ func NewSA(config SAConfig) (*SA, error) {
 		return nil, err
 	}
 	var iv [aes.BlockSize]byte
-	encrypt := cipher.NewCBCEncrypter(block, iv[:block.BlockSize()]).(cbcMode)
 	decrypt := cipher.NewCBCDecrypter(block, iv[:block.BlockSize()]).(cbcMode)
-	s := &SA{encrypt: encrypt, decrypt: decrypt, replay: replay, spi: config.SPI, block: block, mac: hmac.New(sha1.New, config.AuthenticationKey), random: config.Random, limits: config.Limits, lifetime: config.Lifetime, created: config.Now(), now: config.Now}
+	s := &SA{decrypt: decrypt, replay: replay, spi: config.SPI, block: block, random: config.Random, limits: config.Limits, lifetime: config.Lifetime, created: config.Now(), now: config.Now}
 	authKey := append([]byte(nil), config.AuthenticationKey...)
 	s.cryptoPool.New = func() any {
 		return &receiveCrypto{mac: hmac.New(sha1.New, authKey), decrypt: cipher.NewCBCDecrypter(block, make([]byte, block.BlockSize())).(cbcMode)}
+	}
+	s.sealPool.New = func() any {
+		return &sealCrypto{mac: hmac.New(sha1.New, authKey), encrypt: cipher.NewCBCEncrypter(block, make([]byte, block.BlockSize())).(cbcMode)}
 	}
 	return s, nil
 }
@@ -114,26 +115,56 @@ func (s *SA) Seal(payload []byte, nextHeader uint8) ([]byte, error) {
 // SealBuffer pads, encrypts and authenticates exclusively owned storage in place.
 // Ownership stays with the caller on both success and failure.
 func (s *SA) SealBuffer(b *packetbuf.Buffer, nextHeader uint8) error {
+	p, err := s.ReserveSeal(b, nextHeader)
+	if err != nil {
+		return err
+	}
+	p.Seal()
+	return nil
+}
+
+// SealPacket is an outbound packet whose sequence number, IV, padding and
+// headers are already fixed. Seal encrypts and authenticates it; it may run on
+// any goroutine, concurrently with other packets of the same SA, because each
+// call uses its own keyed state. The buffer must not change until Seal returns.
+type SealPacket struct {
+	sa         *SA
+	wire       []byte
+	headerSize int
+}
+
+type sealCrypto struct {
+	mac     hash.Hash
+	encrypt cbcMode
+	icv     [sha1.Size]byte
+}
+
+// ReserveSeal does the ordered part of sealing under the SA lock: it checks the
+// sequence space and lifetime, generates the IV, assigns the next sequence
+// number and writes headers and padding. Callers that seal in parallel must
+// send packets in reservation order, or within the peer's replay window.
+// Ownership stays with the caller on both success and failure.
+func (s *SA) ReserveSeal(b *packetbuf.Buffer, nextHeader uint8) (SealPacket, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sequence == ^uint32(0) {
-		return ErrSequenceExhausted
+		return SealPacket{}, ErrSequenceExhausted
 	}
 	size := b.Len()
 	if err := s.checkLifetime(uint64(size)); err != nil {
-		return err
+		return SealPacket{}, err
 	}
 	blockSize := s.block.BlockSize()
 	padLength := (blockSize - (size+2)%blockSize) % blockSize
 	headerSize := HeaderSize + blockSize
 	tailSize := padLength + 2 + ICVSizeHMACSHA196
 	if size > packetbuf.MaxWire-headerSize-tailSize || b.Headroom() < headerSize || b.Tailroom() < tailSize {
-		return packetbuf.ErrSize
+		return SealPacket{}, packetbuf.ErrSize
 	}
 	// Generate before mutating the packet or consuming sequence/lifetime state.
 	if _, err := io.ReadFull(s.random, s.sealIV[:blockSize]); err != nil {
 		clear(s.sealIV[:])
-		return err
+		return SealPacket{}, err
 	}
 	header, _ := b.Prepend(headerSize)
 	tail, _ := b.Append(tailSize)
@@ -146,15 +177,22 @@ func (s *SA) SealBuffer(b *packetbuf.Buffer, nextHeader uint8) error {
 		tail[i] = byte(i + 1)
 	}
 	tail[padLength], tail[padLength+1] = byte(padLength), nextHeader
-	wire := b.Bytes()
-	authEnd := len(wire) - ICVSizeHMACSHA196
-	plain := wire[headerSize:authEnd]
-	s.encrypt.SetIV(header[HeaderSize:])
-	s.encrypt.CryptBlocks(plain, plain)
-	copy(wire[authEnd:], s.calculateICV(wire[:authEnd]))
 	s.packets++
 	s.bytes += uint64(size)
-	return nil
+	return SealPacket{sa: s, wire: b.Bytes(), headerSize: headerSize}, nil
+}
+
+// Seal encrypts and authenticates the reserved packet in place.
+func (p SealPacket) Seal() {
+	c := p.sa.sealPool.Get().(*sealCrypto)
+	defer p.sa.sealPool.Put(c)
+	authEnd := len(p.wire) - ICVSizeHMACSHA196
+	plain := p.wire[p.headerSize:authEnd]
+	c.encrypt.SetIV(p.wire[HeaderSize:p.headerSize])
+	c.encrypt.CryptBlocks(plain, plain)
+	c.mac.Reset()
+	_, _ = c.mac.Write(p.wire[:authEnd])
+	copy(p.wire[authEnd:], c.mac.Sum(c.icv[:0])[:ICVSizeHMACSHA196])
 }
 
 // Open preserves caller-owned ciphertext; OpenInPlace explicitly permits mutation.
@@ -293,12 +331,4 @@ func (s *SA) checkLifetime(nextBytes uint64) error {
 // allocation is off the per-packet path. Callers hold s.mu.
 func (s *SA) lifetimeError(reason LifetimeReason, limit uint64, age time.Duration) error {
 	return &LifetimeError{SPI: s.spi, Reason: reason, Packets: s.packets, Bytes: s.bytes, Limit: limit, Lifetime: s.lifetime, Age: age}
-}
-
-// calculateICV reuses keyed state and digest storage under s.mu. The result is
-// borrowed until the next call and must be consumed before releasing the lock.
-func (s *SA) calculateICV(wire []byte) []byte {
-	s.mac.Reset()
-	_, _ = s.mac.Write(wire)
-	return s.mac.Sum(s.icv[:0])[:ICVSizeHMACSHA196]
 }

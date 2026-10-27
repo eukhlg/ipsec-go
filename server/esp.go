@@ -438,6 +438,41 @@ func (r *ESPRegistry) SealBuffer(session *Association, peer net.Addr, buffer *pa
 	return ESPDatagram{Payload: buffer.Bytes(), Peer: peer, NATT: session.encapsulation == isakmp.EncapsulationNATTTransport, Buffer: buffer}, nil
 }
 
+// ESPSeal is a reserved outbound ESP packet: its sequence number and headers
+// are fixed and Seal may run on any goroutine. The buffer stays owned by the
+// ESPSeal until Seal hands it to the returned datagram, or Release frees it.
+type ESPSeal struct {
+	packet   esp.SealPacket
+	datagram ESPDatagram
+}
+
+// ReserveSealBuffer is the ordered half of SealBuffer (esp.SA.ReserveSeal).
+// Packets of one SA must be sent in reservation order, or within the peer's
+// replay window. Ownership stays with the caller on failure.
+func (r *ESPRegistry) ReserveSealBuffer(session *Association, peer net.Addr, buffer *packetbuf.Buffer, next uint8) (ESPSeal, error) {
+	if session == nil || session.owner != r || session.revoked.Load() {
+		return ESPSeal{}, ErrUnknownESP
+	}
+	packet, err := session.outbound.ReserveSeal(buffer, next)
+	if errors.Is(err, esp.ErrSALifetime) {
+		r.removeExpired(session, err, RemoveDirectionOutbound)
+	}
+	if err != nil {
+		return ESPSeal{}, err
+	}
+	return ESPSeal{packet: packet, datagram: ESPDatagram{Payload: buffer.Bytes(), Peer: peer, NATT: session.encapsulation == isakmp.EncapsulationNATTTransport, Buffer: buffer}}, nil
+}
+
+// Seal encrypts and authenticates the packet and returns its datagram, which
+// then owns the buffer exactly as one returned by SealBuffer.
+func (s ESPSeal) Seal() ESPDatagram {
+	s.packet.Seal()
+	return s.datagram
+}
+
+// Release frees the buffer of a reservation that will not be sealed.
+func (s ESPSeal) Release() { s.datagram.Release() }
+
 func (r *ESPRegistry) Cookie(session *Association) isakmp.Cookie {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
