@@ -349,7 +349,9 @@ func (s *ESPTransportServer) processMessageDispatch(ctx context.Context, handler
 	n := len(wire)
 	if s.NATT {
 		kind, payload := esp.ClassifyNATT(wire)
-		s.trace("natt udp/4500 rx peer=%s bytes=%d kind=%d", peer, n, kind)
+		if s.Tracef != nil { // argument boxing allocates per packet
+			s.trace("natt udp/4500 rx peer=%s bytes=%d kind=%d", peer, n, kind)
+		}
 		switch kind {
 		case esp.NATTKeepalive:
 			return nil
