@@ -107,8 +107,9 @@ func (p *espReceivePipeline) finish(ctx context.Context, w espReceiveWork) {
 		p.server.debugDrop("esp plaintext drop", w.peer, err, "esp plaintext drop peer=%s error=%v", w.peer, err)
 		return
 	}
-	if err = p.server.deliverResult(ctx, result, func(dispatch func(context.Context) error) error {
-		if err := p.enqueue(espDelivery{dispatch: dispatch, buffer: w.buffer}); err != nil {
+	if err = p.server.deliverResult(ctx, result, func(item espDelivery) error {
+		item.buffer = w.buffer
+		if err := p.enqueue(item); err != nil {
 			return err
 		}
 		w.buffer = nil // delivery exclusively owns storage after successful enqueue

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/eukhlg/ipsec-go/protocol/esp"
@@ -19,19 +18,20 @@ import (
 type ESPPacketResult struct {
 	Datagrams []ESPDatagram
 	Dispatch  func(context.Context) error
+	// Flow, when FlowValid, names the flow of a data dispatch. With several
+	// DeliveryWorkers, dispatches of one flow keep their order on one worker;
+	// a dispatch without a flow is ordered against all others.
+	Flow      uint32
+	FlowValid bool
 }
 type ESPDecryptedHandler func(context.Context, *Association, net.Addr, []byte, uint8, time.Time) (ESPPacketResult, error)
 
 type ESPPacketHandler func(context.Context, net.Addr, []byte, time.Time) (ESPPacketResult, error)
 
-// ESPDeliveryCapacity bounds pending borrowed packets per listener. Together
-// with the receive batch and one executing callback this bounds packet storage.
+// ESPDeliveryCapacity bounds pending borrowed packets per listener, split
+// evenly (rounded up) across delivery workers. Together with the receive batch
+// and one executing callback per worker this bounds packet storage.
 const ESPDeliveryCapacity = 64
-
-type espDelivery struct {
-	dispatch func(context.Context) error
-	buffer   *packetbuf.Buffer
-}
 
 type ESPTransportServer struct {
 	// ReceiveWorkers >1 enables parallel crypto for the optional phased API.
@@ -40,6 +40,10 @@ type ESPTransportServer struct {
 	// NewDeliveryBatch creates per-delivery-goroutine state. Its flush runs
 	// after every bounded FIFO drain, before buffers are released or we block.
 	NewDeliveryBatch func(context.Context) (context.Context, func() error)
+	// DeliveryWorkers >1 runs post-commit dispatch on that many goroutines,
+	// each with its own FIFO and delivery batch, chosen by ESPPacketResult.Flow.
+	// Zero and one retain the single delivery goroutine. Configure before Serve.
+	DeliveryWorkers int
 	// UDPBatchSize bounds NAT-T receive batches. Zero uses the transport default.
 	// Configure before Serve; valid positive sizes are 1..256.
 	UDPBatchSize int
@@ -130,58 +134,7 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 	if err != nil {
 		return err
 	}
-	queue := make(chan espDelivery, ESPDeliveryCapacity)
-	deliveryDone := make(chan struct{})
-	var callbackStarted atomic.Int64
-	var deliveryErr error // published by closing deliveryDone
-	go func() {
-		defer close(deliveryDone)
-		// One context value per delivery goroutine; its slot is updated per
-		// packet, so dispatch allocates nothing per packet.
-		current := &deliveryBufferSlot{}
-		deliveryCtx := context.WithValue(ctx, deliveryBufferKey{}, current)
-		flush := func() error { return nil }
-		if s.NewDeliveryBatch != nil {
-			deliveryCtx, flush = s.NewDeliveryBatch(deliveryCtx)
-		}
-		batch := make([]espDelivery, 0, ESPDeliveryCapacity)
-		for first := range queue {
-			batch = append(batch[:0], first)
-		drain:
-			for s.NewDeliveryBatch != nil && len(batch) < ESPDeliveryCapacity {
-				select {
-				case item, ok := <-queue:
-					if !ok {
-						break drain
-					}
-					batch = append(batch, item)
-				default:
-					break drain
-				}
-			}
-			callbackStarted.Store(time.Now().UnixNano())
-			for _, item := range batch {
-				if ctx.Err() == nil {
-					current.buffer = item.buffer
-					err := item.dispatch(deliveryCtx)
-					current.buffer = nil
-					if err != nil {
-						deliveryErr = err
-						cancel()
-					}
-				}
-			}
-			if err := flush(); err != nil {
-				deliveryErr = err
-				cancel()
-			}
-			callbackStarted.Store(0)
-			for i := range batch {
-				release(batch[i].buffer)
-				batch[i] = espDelivery{}
-			}
-		}
-	}()
+	delivery := s.newDeliverer(ctx, cancel, release)
 
 	watchdogDone := make(chan struct{})
 	go func() {
@@ -194,16 +147,16 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 			case <-ctx.Done():
 				return
 			case now := <-ticker.C:
-				if start := callbackStarted.Load(); start != 0 && now.Sub(time.Unix(0, start)) >= 100*time.Millisecond && now.Sub(lastCallback) >= 5*time.Second {
-					s.debug("esp delivery callback stalled duration=%s", now.Sub(time.Unix(0, start)))
+				if stalled := delivery.stalled(now); stalled >= 100*time.Millisecond && now.Sub(lastCallback) >= 5*time.Second {
+					s.debug("esp delivery callback stalled duration=%s", stalled)
 					lastCallback = now
 				}
-				if len(queue) == cap(queue) {
+				if full, capacity := delivery.full(); full {
 					if fullSince.IsZero() {
 						fullSince = now
 					}
 					if now.Sub(fullSince) >= time.Second && now.Sub(lastFull) >= 5*time.Second {
-						s.debug("esp delivery FIFO full duration=%s capacity=%d", now.Sub(fullSince), cap(queue))
+						s.debug("esp delivery FIFO full duration=%s capacity=%d", now.Sub(fullSince), capacity)
 						lastFull = now
 					}
 				} else {
@@ -227,12 +180,11 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 	}()
 	defer func() {
 		cancel()
-		close(queue)
-		<-deliveryDone
+		delivery.close()
 		<-stopped
 		<-watchdogDone
-		if deliveryErr != nil {
-			serveErr = deliveryErr
+		if err := delivery.failure(); err != nil {
+			serveErr = err
 		} else if parent.Err() != nil {
 			serveErr = nil
 		}
@@ -281,14 +233,7 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 	}
 	var receivingBuffer **packetbuf.Buffer
 	if s.Registry != nil && s.HandleDecrypted != nil && s.ReceiveWorkers > 1 {
-		pipeline := s.newReceivePipeline(ctx, cancel, release, func(item espDelivery) error {
-			select {
-			case queue <- item:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		})
+		pipeline := s.newReceivePipeline(ctx, cancel, release, delivery.enqueue)
 		defer func() {
 			cancel()
 			pipeline.closeAndWait()
@@ -354,17 +299,13 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 			receivingBuffer = &buffers[i]
 			m := &messages[i]
 			if !m.Truncated && m.N >= 0 && m.N <= len(m.Payload) {
-				if processErr := s.processMessageDispatch(ctx, handler, m.Peer, m.Payload[:m.N:m.N], func(dispatch func(context.Context) error) error {
-					if ctx.Err() != nil {
-						return ctx.Err()
+				if processErr := s.processMessageDispatch(ctx, handler, m.Peer, m.Payload[:m.N:m.N], func(item espDelivery) error {
+					item.buffer = buffers[i]
+					if err := delivery.enqueue(item); err != nil {
+						return err
 					}
-					select {
-					case queue <- espDelivery{dispatch: dispatch, buffer: buffers[i]}:
-						buffers[i] = nil // successful enqueue transfers exclusive ownership
-						return nil
-					case <-ctx.Done():
-						return ctx.Err()
-					}
+					buffers[i] = nil // successful enqueue transfers exclusive ownership
+					return nil
 				}); processErr != nil {
 					return processErr
 				}
@@ -401,10 +342,10 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 }
 
 func (s *ESPTransportServer) processMessage(ctx context.Context, handler ESPPacketHandler, peer net.Addr, wire []byte) error {
-	return s.processMessageDispatch(ctx, handler, peer, wire, func(dispatch func(context.Context) error) error { return dispatch(ctx) })
+	return s.processMessageDispatch(ctx, handler, peer, wire, func(item espDelivery) error { return item.dispatch(ctx) })
 }
 
-func (s *ESPTransportServer) processMessageDispatch(ctx context.Context, handler ESPPacketHandler, peer net.Addr, wire []byte, deliver func(func(context.Context) error) error) error {
+func (s *ESPTransportServer) processMessageDispatch(ctx context.Context, handler ESPPacketHandler, peer net.Addr, wire []byte, deliver func(espDelivery) error) error {
 	n := len(wire)
 	if s.NATT {
 		kind, payload := esp.ClassifyNATT(wire)
@@ -458,7 +399,9 @@ func (s *ESPTransportServer) processMessageDispatch(ctx context.Context, handler
 	return s.deliverResult(ctx, result, deliver)
 }
 
-func (s *ESPTransportServer) deliverResult(ctx context.Context, result ESPPacketResult, deliver func(func(context.Context) error) error) error {
+// deliverResult writes replies, then hands the dispatch to deliver; the
+// caller adds the buffer.
+func (s *ESPTransportServer) deliverResult(ctx context.Context, result ESPPacketResult, deliver func(espDelivery) error) error {
 	if err := func() error {
 		defer func() {
 			for _, reply := range result.Datagrams {
@@ -475,7 +418,7 @@ func (s *ESPTransportServer) deliverResult(ctx context.Context, result ESPPacket
 			}
 		}
 		if result.Dispatch != nil {
-			return deliver(result.Dispatch)
+			return deliver(espDelivery{dispatch: result.Dispatch, flow: result.Flow, keyed: result.FlowValid})
 		}
 		return nil
 	}(); err != nil {

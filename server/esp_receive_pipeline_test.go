@@ -69,7 +69,8 @@ func TestParallelReceiveOrderAndOwnership(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				delivered := 0
-				s := &ESPTransportServer{Conn: conn, NATT: natt, Registry: r, ReceiveWorkers: workers}
+				// Unkeyed dispatches stay in total order across delivery workers.
+				s := &ESPTransportServer{Conn: conn, NATT: natt, Registry: r, ReceiveWorkers: workers, DeliveryWorkers: workers}
 				s.HandlePacket = func(context.Context, net.Addr, []byte, time.Time) (ESPPacketResult, error) {
 					panic("legacy handler called")
 				}
@@ -322,7 +323,7 @@ func TestParallelReceiveEarlyIKEMaintenanceRevokesPendingESP(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-started
-	if err := s.processMessageDispatch(ctx, nil, peer, esp.EncapsulateNATTIKE([]byte{1}), func(func(context.Context) error) error { return nil }); err != nil {
+	if err := s.processMessageDispatch(ctx, nil, peer, esp.EncapsulateNATTIKE([]byte{1}), func(espDelivery) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	close(resume)
