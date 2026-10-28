@@ -31,6 +31,9 @@ type Association struct {
 	ikeCookie               isakmp.Cookie
 	expiresAt               time.Time
 	revoked                 atomic.Bool
+	// active is the Active method value, built once so ESPSender's per-packet
+	// eligibility check does not allocate.
+	active func() bool
 }
 
 // DefaultInboundReplayWindowSize tolerates burst reordering on fast VPN links.
@@ -199,6 +202,7 @@ func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
 		r.notify(events)
 	}()
 	session := &Association{owner: r, peerIP: append(net.IP(nil), ip...), peer: clonePeer(peer), inbound: inbound, outbound: outbound, encapsulation: pair.Transform.Encapsulation, inboundSPI: pair.Inbound.SPI, outboundSPI: pair.Outbound.SPI, ikeCookie: pair.ResponderCookie}
+	session.active = session.Active
 	if lifetime > 0 {
 		session.expiresAt = time.Now().Add(lifetime)
 	}
