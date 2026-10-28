@@ -121,3 +121,12 @@ func sameError(a, b error) bool {
 	}
 	return a == b || (errors.Is(a, ErrSALifetime) && errors.Is(b, ErrSALifetime) && a.Error() == b.Error())
 }
+
+// calculateICV serves the serial reference implementation above.
+func (s *SA) calculateICV(wire []byte) []byte {
+	c := s.sealPool.Get().(*sealCrypto)
+	defer s.sealPool.Put(c)
+	c.mac.Reset()
+	_, _ = c.mac.Write(wire)
+	return append([]byte(nil), c.mac.Sum(c.icv[:0])[:ICVSizeHMACSHA196]...)
+}

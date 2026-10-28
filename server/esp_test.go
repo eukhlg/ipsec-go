@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"github.com/eukhlg/ipsec-go/protocol/esp"
 	"github.com/eukhlg/ipsec-go/protocol/isakmp"
+	"github.com/eukhlg/netio/packetbuf"
 	"net"
 	"testing"
 )
@@ -153,4 +154,50 @@ func TestAssociationOwnsPeerAddress(t *testing.T) {
 	if NewESPRegistry().Cookie(association) != (isakmp.Cookie{}) {
 		t.Fatal("foreign registry exposed cookie")
 	}
+}
+
+func TestRegistryReserveSealBuffer(t *testing.T) {
+	registry := NewESPRegistry()
+	pair := testESPPair(isakmp.EncapsulationNATTTransport)
+	peer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 4500}
+	if err := registry.Install(peer, pair); err != nil {
+		t.Fatal(err)
+	}
+	inbound, _ := esp.NewSA(esp.SAConfig{SPI: pair.Inbound.SPI, Transform: pair.Transform, EncryptionKey: pair.Inbound.EncryptionKey, AuthenticationKey: pair.Inbound.AuthenticationKey})
+	outbound, _ := esp.NewSA(esp.SAConfig{SPI: pair.Outbound.SPI, Transform: pair.Transform, EncryptionKey: pair.Outbound.EncryptionKey, AuthenticationKey: pair.Outbound.AuthenticationKey})
+	wire, _ := inbound.Seal([]byte("hello"), 6)
+	association, _, _, err := registry.Open(peer, wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reserve in order, seal in reverse order, deliver in reservation order.
+	var seals []ESPSeal
+	for i := 0; i < 3; i++ {
+		buffer, _ := packetbuf.Copy([]byte{byte(i), 1, 2})
+		seal, err := registry.ReserveSealBuffer(association, peer, buffer, 6)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seals = append(seals, seal)
+	}
+	datagrams := make([]ESPDatagram, len(seals))
+	for i := len(seals) - 1; i >= 0; i-- {
+		datagrams[i] = seals[i].Seal()
+	}
+	for i, d := range datagrams {
+		if !d.NATT || d.Peer != peer || d.Buffer == nil {
+			t.Fatalf("datagram %d metadata %+v", i, d)
+		}
+		payload, next, err := outbound.Open(d.Payload)
+		if err != nil || next != 6 || payload[0] != byte(i) {
+			t.Fatalf("datagram %d: %v %d %v", i, payload, next, err)
+		}
+		d.Release()
+	}
+	registry.Remove(pair.Inbound.SPI)
+	buffer, _ := packetbuf.Copy([]byte{1})
+	if _, err := registry.ReserveSealBuffer(association, peer, buffer, 6); err != ErrUnknownESP {
+		t.Fatalf("revoked: %v", err)
+	}
+	buffer.Release()
 }

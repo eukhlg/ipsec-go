@@ -1,5 +1,5 @@
-github.com/eukhlg/netio v0.0.0-20261023143205-8089b0aca545 h1:rNHm2060BT11ET75mS30BJhpq6enz6UYXU0AcdtN73c=
-github.com/eukhlg/netio v0.0.0-20261023143205-8089b0aca545/go.mod h1:MGjORjEdlvdxIA8y33aXnns03ltdmJhNXOGppoFCkEA=
+github.com/eukhlg/netio v0.0.0-20261028092000-93d9aa9c7f9b h1:9RIfSuGPP6MsIyIT1QnVaEKfilKN2ODTI+hw+Ehqhcw=
+github.com/eukhlg/netio v0.0.0-20261028092000-93d9aa9c7f9b/go.mod h1:MGjORjEdlvdxIA8y33aXnns03ltdmJhNXOGppoFCkEA=
 golang.org/x/net v0.47.0 h1:Mx+4dIFzqraBXUugkia1OOvlD6LemFo1ALMHjrXDOhY=
 golang.org/x/net v0.47.0/go.mod h1:/jNxtkgq5yWUGYkaZGqo27cfGZ1c5Nen03aYrrKpVRU=
 golang.org/x/sys v0.38.0 h1:3yZWxaJjBmCWXqhN1qh02AkOnCQ1poK6oF+a7xWL6Gc=
