@@ -35,6 +35,23 @@ type espReceivePipeline struct {
 	release func(*packetbuf.Buffer)
 	enqueue func(espDelivery) error
 	crypto  func(*ESPReceive)
+	// receives recycles prechecked packets once committed or discarded, so a
+	// packet in flight allocates nothing.
+	receives sync.Pool
+}
+
+func (p *espReceivePipeline) receive() *ESPReceive {
+	if r, ok := p.receives.Get().(*ESPReceive); ok {
+		return r
+	}
+	return new(ESPReceive)
+}
+
+// recycle returns r once nothing refers to it, without its references to
+// the SA and the received storage.
+func (p *espReceivePipeline) recycle(r *ESPReceive) {
+	*r = ESPReceive{}
+	p.receives.Put(r)
 }
 
 func (s *ESPTransportServer) newReceivePipeline(ctx context.Context, cancel context.CancelFunc, release func(*packetbuf.Buffer), enqueue func(espDelivery) error) *espReceivePipeline {
@@ -64,13 +81,15 @@ func (p *espReceivePipeline) authenticate(w espReceiveWork) (out espReceiveWork)
 	return w
 }
 
-// submit transfers buffer to the pipeline on success; on failure the caller
-// keeps it.
+// submit transfers buffer and packet to the pipeline on success; on failure
+// the caller keeps them. peer is retained without a copy: received peers are
+// never modified once returned (netio's Message.Peer is read-only and shared,
+// and ReadFrom returns a new address).
 func (p *espReceivePipeline) submit(packet *ESPReceive, peer net.Addr, now time.Time, buffer *packetbuf.Buffer) error {
 	if err := p.ctx.Err(); err != nil {
 		return err
 	}
-	if err := p.pool.Submit(espReceiveWork{packet: packet, peer: clonePeer(peer), now: now, buffer: buffer}); err != nil {
+	if err := p.pool.Submit(espReceiveWork{packet: packet, peer: peer, now: now, buffer: buffer}); err != nil {
 		if ctxErr := p.ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
@@ -84,6 +103,7 @@ func (p *espReceivePipeline) discard(w espReceiveWork) {
 	if w.buffer != nil {
 		p.release(w.buffer)
 	}
+	p.recycle(w.packet)
 }
 func (p *espReceivePipeline) finish(ctx context.Context, w espReceiveWork) {
 	defer func() {
@@ -93,6 +113,7 @@ func (p *espReceivePipeline) finish(ctx context.Context, w espReceiveWork) {
 		if w.buffer != nil {
 			p.release(w.buffer)
 		}
+		p.recycle(w.packet)
 	}()
 	if ctx.Err() != nil {
 		return

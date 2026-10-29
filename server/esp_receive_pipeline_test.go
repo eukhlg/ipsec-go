@@ -319,6 +319,7 @@ func TestParallelReceiveEarlyIKEMaintenanceRevokesPendingESP(t *testing.T) {
 	b, _ := pool.acquire(len(wire))
 	copy(b.Bytes(), wire)
 	packet, _ := r.Precheck(peer, b.Bytes())
+	association := packet.association // the pipeline recycles packet when done
 	if err := p.submit(packet, peer, time.Now(), b); err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +333,7 @@ func TestParallelReceiveEarlyIKEMaintenanceRevokesPendingESP(t *testing.T) {
 	if !maintained || control.SACount() != 0 || r.Count() != 0 {
 		t.Fatal("inline IKE did not retire pending work")
 	}
-	if state := packet.association.inbound.ReplayState(1); state.Highest != 0 {
+	if state := association.inbound.ReplayState(1); state.Highest != 0 {
 		t.Fatal("retired worker advanced replay")
 	}
 }
@@ -450,4 +451,26 @@ func TestDeliveryWatchdogReportsStallAndFullFIFO(t *testing.T) {
 		t.Fatal(err)
 	}
 	pool.check()
+}
+
+// Prechecking into caller storage allocates nothing per packet.
+func TestPrecheckIntoDoesNotAllocate(t *testing.T) {
+	r, client, peer := receiveFixture(t)
+	wire, err := client.Seal([]byte{1}, 17)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p ESPReceive
+	precheck := func() {
+		if err := r.PrecheckInto(peer, wire, &p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if allocs := testing.AllocsPerRun(100, precheck); allocs != 0 {
+		t.Fatalf("precheck allocates %v per packet", allocs)
+	}
+	p.Authenticate()
+	if association, _, _, err := p.Commit(); err != nil || association == nil {
+		t.Fatalf("commit after PrecheckInto: %v", err)
+	}
 }

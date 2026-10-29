@@ -238,20 +238,31 @@ type ReceivePacket struct {
 
 // Precheck decodes and checks replay eligibility without changing the window.
 func (s *SA) Precheck(wire []byte) (*ReceivePacket, error) {
-	packet, err := DecodePacketView(wire, s.block.BlockSize(), ICVSizeHMACSHA196)
-	if err != nil {
+	p := new(ReceivePacket)
+	if err := s.PrecheckInto(wire, p); err != nil {
 		return nil, err
 	}
+	return p, nil
+}
+
+// PrecheckInto is Precheck into caller storage, so a packet allocates nothing.
+// On success p is reset to the new packet; on error p is left unchanged.
+func (s *SA) PrecheckInto(wire []byte, p *ReceivePacket) error {
+	packet, err := DecodePacketView(wire, s.block.BlockSize(), ICVSizeHMACSHA196)
+	if err != nil {
+		return err
+	}
 	if packet.SPI != s.spi {
-		return nil, ErrInvalidPacket
+		return ErrInvalidPacket
 	}
 	s.mu.Lock()
 	err = s.replay.Check(packet.Sequence)
 	s.mu.Unlock()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &ReceivePacket{sa: s, packet: packet, wire: wire}, nil
+	*p = ReceivePacket{sa: s, packet: packet, wire: wire}
+	return nil
 }
 
 // Authenticate checks the constant-time ICV before any in-place decryption.

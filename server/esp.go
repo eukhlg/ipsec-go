@@ -31,6 +31,9 @@ type Association struct {
 	ikeCookie               isakmp.Cookie
 	expiresAt               time.Time
 	revoked                 atomic.Bool
+	// active is the Active method value, built once so ESPSender's per-packet
+	// eligibility check does not allocate.
+	active func() bool
 }
 
 // DefaultInboundReplayWindowSize tolerates burst reordering on fast VPN links.
@@ -199,6 +202,7 @@ func (r *ESPRegistry) Install(peer net.Addr, pair isakmp.ESPPair) error {
 		r.notify(events)
 	}()
 	session := &Association{owner: r, peerIP: append(net.IP(nil), ip...), peer: clonePeer(peer), inbound: inbound, outbound: outbound, encapsulation: pair.Transform.Encapsulation, inboundSPI: pair.Inbound.SPI, outboundSPI: pair.Outbound.SPI, ikeCookie: pair.ResponderCookie}
+	session.active = session.Active
 	if lifetime > 0 {
 		session.expiresAt = time.Now().Add(lifetime)
 	}
@@ -554,21 +558,31 @@ func (r *ESPRegistry) ReplayState(peer net.Addr, wire []byte) (esp.ReplayState, 
 type ESPReceive struct {
 	registry    *ESPRegistry
 	association *Association
-	packet      *esp.ReceivePacket
+	packet      esp.ReceivePacket
 }
 
 // Precheck performs lookup and a read-only replay check. Removal does not erase
 // crypto keys; the retained association keeps its contexts live for workers.
 func (r *ESPRegistry) Precheck(peer net.Addr, wire []byte) (*ESPReceive, error) {
+	p := new(ESPReceive)
+	if err := r.PrecheckInto(peer, wire, p); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// PrecheckInto is Precheck into caller storage, so a packet allocates nothing.
+// On error p may hold a partial result and must not be used.
+func (r *ESPRegistry) PrecheckInto(peer net.Addr, wire []byte, p *ESPReceive) error {
 	association, err := r.lookup(peer, wire)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	packet, err := association.inbound.Precheck(wire)
-	if err != nil {
-		return nil, err
+	if err := association.inbound.PrecheckInto(wire, &p.packet); err != nil {
+		return err
 	}
-	return &ESPReceive{registry: r, association: association, packet: packet}, nil
+	p.registry, p.association = r, association
+	return nil
 }
 func (p *ESPReceive) Authenticate() { p.packet.Authenticate() }
 

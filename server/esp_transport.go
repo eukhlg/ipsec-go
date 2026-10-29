@@ -219,8 +219,8 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 	}
 	if s.Registry != nil && s.HandleDecrypted != nil {
 		handler = func(ctx context.Context, peer net.Addr, wire []byte, now time.Time) (ESPPacketResult, error) {
-			p, err := s.Registry.Precheck(peer, wire)
-			if err != nil {
+			var p ESPReceive
+			if err := s.Registry.PrecheckInto(peer, wire, &p); err != nil {
 				return ESPPacketResult{}, err
 			}
 			p.Authenticate()
@@ -242,11 +242,13 @@ func (s *ESPTransportServer) serve(parent context.Context, acquire func(int) (*p
 			}
 		}()
 		handler = func(ctx context.Context, peer net.Addr, wire []byte, now time.Time) (ESPPacketResult, error) {
-			p, err := s.Registry.Precheck(peer, wire)
-			if err != nil {
+			p := pipeline.receive()
+			if err := s.Registry.PrecheckInto(peer, wire, p); err != nil {
+				pipeline.recycle(p)
 				return ESPPacketResult{}, err
 			}
 			if err := pipeline.submit(p, peer, now, *receivingBuffer); err != nil {
+				pipeline.recycle(p)
 				return ESPPacketResult{}, err
 			}
 			*receivingBuffer = nil
@@ -349,7 +351,9 @@ func (s *ESPTransportServer) processMessageDispatch(ctx context.Context, handler
 	n := len(wire)
 	if s.NATT {
 		kind, payload := esp.ClassifyNATT(wire)
-		s.trace("natt udp/4500 rx peer=%s bytes=%d kind=%d", peer, n, kind)
+		if s.Tracef != nil { // argument boxing allocates per packet
+			s.trace("natt udp/4500 rx peer=%s bytes=%d kind=%d", peer, n, kind)
+		}
 		switch kind {
 		case esp.NATTKeepalive:
 			return nil
